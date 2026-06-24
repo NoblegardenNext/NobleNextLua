@@ -13,11 +13,20 @@
 --   WORLD (-1)  — регистрация хуков, глобальная очередь, GetPlayerByGUID
 --   MAP  (>0)   — скрипт загружается, но хуки здесь не вешаем (иначе дубли / мимо)
 
+if not _G.NN_BOOTSTRAP_ACTIVE then return end
+
+local NobleNext = require("NobleNext")
+
+if _G.NN_MOD_AUTOMOUNT_BOOTSTRAPPED then
+    return package.loaded["Modules.AutoMount.NNAutoMountInit"] or {}
+end
+_G.NN_MOD_AUTOMOUNT_BOOTSTRAPPED = true
+
 local PLAYER_EVENT_ON_LOGIN  = 3
 local PLAYER_EVENT_ON_LOGOUT = 4
 
 local BATCH_SIZE     = 15  -- маунтов на игрока за один тик очереди
-local BATCH_DELAY_MS = 1   -- пауза между тиками, мс
+local BATCH_DELAY_MS = 50  -- пауза между тиками, мс
 
 local MOUNTS = {
     458,
@@ -1649,7 +1658,7 @@ local pending = {}
 local queueScheduled = false
 
 local function playerGuidLow(player)
-    return tonumber(tostring(player:GetGUIDLow()))
+    return player:GetGUIDLow()
 end
 
 local function processMountQueue()
@@ -1711,8 +1720,9 @@ end
 if GetStateMapId() == -1 then
     RegisterPlayerEvent(PLAYER_EVENT_ON_LOGIN, OnLogin)
     RegisterPlayerEvent(PLAYER_EVENT_ON_LOGOUT, OnLogout)
-    print(string.format(
-        "[Eluna] AutoMount: ON_LOGIN (%d) / ON_LOGOUT (%d) registered in WORLD state; %d mounts, batch %d.",
+    NobleNext.RegisterModule("AutoMount", { layer = "Modules", mounts = #MOUNTS, batch = BATCH_SIZE })
+    NobleNext.Log("AutoMount", string.format(
+        "ON_LOGIN (%d) / ON_LOGOUT (%d) registered in WORLD state; %d mounts, batch %d.",
         PLAYER_EVENT_ON_LOGIN,
         PLAYER_EVENT_ON_LOGOUT,
         #MOUNTS,
