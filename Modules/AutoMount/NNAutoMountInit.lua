@@ -25,8 +25,7 @@ _G.NN_MOD_AUTOMOUNT_BOOTSTRAPPED = true
 local PLAYER_EVENT_ON_LOGIN  = 3
 local PLAYER_EVENT_ON_LOGOUT = 4
 
-local BATCH_SIZE     = 15  -- маунтов на игрока за один тик очереди
-local BATCH_DELAY_MS = 50  -- пауза между тиками, мс
+local GRANT_DELAY_MS = 1000 -- задержка после входа перед тихой выдачей, мс
 
 local MOUNTS = {
     458,
@@ -1653,7 +1652,7 @@ local MOUNTS = {
 	1283838,
 }
 
--- [guidLow] = { index = number, guid = ObjectGuid }
+-- [guidLow] = ObjectGuid
 local pending = {}
 local queueScheduled = false
 
@@ -1661,31 +1660,17 @@ local function playerGuidLow(player)
     return player:GetGUIDLow()
 end
 
+-- LearnSpellsSilently (C++): один пакет изученных заклинаний + одно полное
+-- обновление коллекции, без тостов «добавлено в коллекцию» и без ачивок
+-- (SMSG_ACHIEVEMENT_EARNED иначе рассылается окружающим и гильдии).
 local function processMountQueue()
-    for guidLow, state in pairs(pending) do
-        local player = GetPlayerByGUID(state.guid)
-        if not player or not player:IsInWorld() then
-            pending[guidLow] = nil
-        else
-            local last = math.min(state.index + BATCH_SIZE - 1, #MOUNTS)
-            for i = state.index, last do
-                local spellId = MOUNTS[i]
-                if not player:HasSpell(spellId) then
-                    player:LearnSpell(spellId)
-                end
-            end
-
-            state.index = last + 1
-            if state.index > #MOUNTS then
-                pending[guidLow] = nil
-            end
+    queueScheduled = false
+    for guidLow, guid in pairs(pending) do
+        pending[guidLow] = nil
+        local player = GetPlayerByGUID(guid)
+        if player and player:IsInWorld() then
+            player:LearnSpellsSilently(MOUNTS)
         end
-    end
-
-    if next(pending) then
-        CreateLuaEvent(processMountQueue, BATCH_DELAY_MS, 1)
-    else
-        queueScheduled = false
     end
 end
 
@@ -1694,23 +1679,16 @@ local function scheduleMountQueue()
         return
     end
     queueScheduled = true
-    CreateLuaEvent(processMountQueue, BATCH_DELAY_MS, 1)
+    CreateLuaEvent(processMountQueue, GRANT_DELAY_MS, 1)
 end
 
 local function OnLogin(_, player)
-    local guidLow = playerGuidLow(player)
-    pending[guidLow] = {
-        index = 1,
-        guid = player:GetGUID(),
-    }
+    pending[playerGuidLow(player)] = player:GetGUID()
     scheduleMountQueue()
 end
 
 local function OnLogout(_, player)
     pending[playerGuidLow(player)] = nil
-    if not next(pending) then
-        queueScheduled = false
-    end
 end
 
 ---------------------------------------------
@@ -1720,12 +1698,11 @@ end
 if GetStateMapId() == -1 then
     RegisterPlayerEvent(PLAYER_EVENT_ON_LOGIN, OnLogin)
     RegisterPlayerEvent(PLAYER_EVENT_ON_LOGOUT, OnLogout)
-    NobleNext.RegisterModule("AutoMount", { layer = "Modules", mounts = #MOUNTS, batch = BATCH_SIZE })
+    NobleNext.RegisterModule("AutoMount", { layer = "Modules", mounts = #MOUNTS })
     NobleNext.Log("AutoMount", string.format(
-        "ON_LOGIN (%d) / ON_LOGOUT (%d) registered in WORLD state; %d mounts, batch %d.",
+        "ON_LOGIN (%d) / ON_LOGOUT (%d) registered in WORLD state; %d mounts, silent grant.",
         PLAYER_EVENT_ON_LOGIN,
         PLAYER_EVENT_ON_LOGOUT,
-        #MOUNTS,
-        BATCH_SIZE
+        #MOUNTS
     ))
 end
