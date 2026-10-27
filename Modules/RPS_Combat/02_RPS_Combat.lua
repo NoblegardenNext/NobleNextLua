@@ -100,6 +100,33 @@ function M.GetNpcDefense(profile, statKey, rng)
     return roll.total, roll
 end
 
+-- Equipment hook: return {dice = "1d6", quality = 0|1} for an equipped shield.
+-- Until shields are stored every Block uses the no-shield formula.
+function M.ResolveShield(profile) return nil end
+
+-- No shield: 1 + Сопротивление; shield: die + Сопротивление + quality.
+-- Armor is not part of this value: ApplyDamageToUnit applies it to the remaining physical damage.
+function M.BlockAbsorb(profile, rng)
+    local resistance = type(profile) == "table" and profile.stats and profile.stats.resistance
+    if not C.Integer(resistance, -1000, 1000) then return nil, "missing_defense_stat" end
+    local shield, base, quality, roll = M.ResolveShield(profile), 1, 0, nil
+    if shield then
+        roll = C.RollDiceString(shield.dice, 0, rng)
+        if not roll then return nil, "invalid_dice" end
+        base, quality = roll.total, shield.quality or 0
+    end
+    return math.max(0, base + resistance + quality),
+        {base = base, resistance = resistance, quality = quality, roll = roll, shield = shield ~= nil}
+end
+
+-- A tie goes to the defender.
+function M.AttackHits(attackTotal, defenseTotal) return attackTotal > defenseTotal end
+
+-- Избегание rolls Уклонение against physical and Сопротивление against magic attacks.
+function M.DefenseStatFor(attack)
+    return type(attack) == "table" and attack.damageType == "magic" and "resistance" or "evasion"
+end
+
 -- Ownership, expiry and exactly-once consumption belong to the runtime queue.
 -- This function only resolves the previously validated server attack snapshot.
 function M.HandleDefenseReaction(profile, attack, choice, defenseStatKey, useFateDie, rng, fatigueStacks)
@@ -117,16 +144,14 @@ function M.HandleDefenseReaction(profile, attack, choice, defenseStatKey, useFat
         local err
         draft, reaction.roll = M.ExecuteStatRoll(draft, defenseStatKey, useFateDie, rng, fatigueStacks)
         if not draft then err = reaction.roll; return nil, err end
-        if reaction.roll.total >= attack.attackTotal then reaction.avoided = true; return draft, reaction end
+        if not M.AttackHits(attack.attackTotal, reaction.roll.total) then reaction.avoided = true; return draft, reaction end
     elseif choice == "BLOCK" then
         local err
         draft, err = M.SpendEnergy(draft, C.BLOCK_ENERGY_COST)
         if not draft then return nil, err end
-        local resistance = draft.stats and draft.stats.resistance
-        if not C.Integer(resistance, -1000, 1000) then return nil, "missing_defense_stat" end
-        local roll = C.RollDiceString(draft.blockDice, 0, rng)
-        if not roll then return nil, "invalid_dice" end
-        block, reaction.blockRoll = math.max(0, roll.total + resistance), roll
+        block, err = M.BlockAbsorb(draft, rng)
+        if not block then return nil, err end
+        reaction.block = err
     end
     local damageRoll = C.RollDiceString(attack.weaponDice, 0, rng)
     local damaged, result = M.ApplyDamageToUnit(draft, damageRoll.total, attack.damageType, block, rng)

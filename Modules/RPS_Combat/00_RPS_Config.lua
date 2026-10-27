@@ -24,7 +24,7 @@ C.Archetypes = {
     healer = { label = "Целитель", speed = 10,
         health = {10,11,12,14,15,16,18,19,20,22}, energy = {12,13,15,17,18,20,22,23,25,27},
         stats = { accuracy = {-1,-1,-1,0,0,0,0,0,0,1}, healing = {2,2,2,2,2,3,3,3,3,4},
-            evasion = {1,1,1,1,1,2,2,2,2,3}, resistance = {0,0,0,0,0,1,1,1,1,2} } },
+            evasion = {0,0,0,0,0,1,1,1,1,2}, resistance = {1,1,1,1,1,2,2,2,2,3} } },
     caster = { label = "Заклинатель", speed = 10,
         health = {10,11,12,13,14,15,16,17,18,20}, energy = {14,16,18,20,23,25,27,29,31,34},
         stats = { accuracy = {1,1,1,1,1,2,2,2,2,3}, healing = {0,0,0,0,0,1,1,1,1,1},
@@ -132,6 +132,35 @@ function C.ReplaceStatDefinitions(rows)
     return true
 end
 
+-- Returns ok, reason: "ok" | "unmapped" | "no_spellinfo" | "effect:<i>:<type>" | "unsafe" | "no_binding".
+function C.SpellStatus(spellId)
+    if not C.Integer(spellId, 1, 2147483647) then return false, "unmapped" end
+    if type(RpsDiceSpellStatus) == "function" then
+        local ok, reason = RpsDiceSpellStatus(spellId)
+        return ok == true, ok == true and "ok" or tostring(reason or "unsafe")
+    end
+    if type(RpsIsDiceSpell) == "function" then
+        if RpsIsDiceSpell(spellId) then return true, "ok" end
+        return false, "unsafe"
+    end
+    return false, "no_binding"
+end
+
+-- Every nonzero mapping that fails the native check: {key=, spellId=, reason=}.
+function C.DiagnoseSpells(rows)
+    local bad = {}
+    for _, row in ipairs(rows or {}) do
+        local id = type(row) == "table" and row.spellId
+        if type(id) == "number" and id > 0 then
+            local ok, reason = C.SpellStatus(id)
+            if not ok then bad[#bad + 1] = {key = row.key, spellId = id, reason = reason} end
+        end
+    end
+    return bad
+end
+
+C.SpellDiagnostics = {}
+
 function C.LoadStatDefinitions(query)
     query = query or WorldDBQuery
     if type(query) ~= "function" then return false, "world_query_unavailable" end
@@ -146,12 +175,55 @@ function C.LoadStatDefinitions(query)
             defaultValue = q:GetInt32(7), description = q:GetString(8) or ""}
         if #rows > C.MAX_DEFINITIONS then return false, "invalid_registry_size" end
     until not q:NextRow()
-    for _, def in ipairs(rows) do
-        if def.spellId>0 and (not RpsIsDiceSpell or not RpsIsDiceSpell(def.spellId)) then
-            return false,"unsafe_or_missing_dice_spell:"..def.key..":"..def.spellId
+    -- A bad spell only loses its mapping; the stat itself and the rest of the registry stay usable.
+    local bad, byKey = C.DiagnoseSpells(rows), {}
+    for _, entry in ipairs(bad) do byKey[entry.key] = entry end
+    for _, row in ipairs(rows) do
+        row.configuredSpellId = row.spellId
+        local entry = byKey[row.key]
+        if entry then row.spellId, row.spellUnavailable = 0, entry.reason end
+    end
+    local ok, why = C.ReplaceStatDefinitions(rows)
+    if ok then C.SpellDiagnostics = bad end
+    return ok, why
+end
+
+-- Actions are separate from the ten standalone dice. actionKey names what is done
+-- (target, cost, consequences); statKey names the stat it rolls. Static: no DB row needed.
+C.Actions = {
+    attack = {key = "attack", spellKey = "rps_action_attack", spellId = 1500011, name = "Атака",
+        kind = "attack", statKey = "accuracy"},
+    evade = {key = "evade", spellKey = "rps_action_evade", spellId = 1500012, name = "Избегание",
+        kind = "reaction", choice = "AVOID"},
+    block = {key = "block", spellKey = "rps_action_block", spellId = 1500013, name = "Блок",
+        kind = "reaction", choice = "BLOCK", energyCost = 2},
+    take = {key = "take", spellId = 0, name = "Принять атаку", kind = "reaction", choice = "TAKE"},
+}
+C.ActionOrder = {"attack", "evade", "block", "take"}
+C.SpellToActionKey, C.ActionSpellStatus = {}, {}
+
+-- A missing/unsafe action spell loses only its own mapping; dice and window actions stay usable.
+function C.RefreshActionSpells()
+    local map, statuses = {}, {}
+    for _, key in ipairs(C.ActionOrder) do
+        local id = C.Actions[key].spellId
+        if id > 0 then
+            local ok, reason = C.SpellStatus(id)
+            if ok and C.SpellToStatKey[id] then ok, reason = false, "collision" end
+            statuses[key] = reason
+            if ok then map[id] = key end
         end
     end
-    return C.ReplaceStatDefinitions(rows)
+    C.SpellToActionKey, C.ActionSpellStatus = map, statuses
+    return map, statuses
+end
+
+function C.SpellDiagnosticsText(list)
+    local parts = {}
+    for _, entry in ipairs(list or C.SpellDiagnostics) do
+        parts[#parts + 1] = tostring(entry.key) .. ":" .. tostring(entry.spellId) .. ":" .. tostring(entry.reason)
+    end
+    return table.concat(parts, ",")
 end
 
 return C

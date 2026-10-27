@@ -113,7 +113,7 @@ end
 
 function S.ReleasePlayer(player)
     local guid = player and C.IdString(player:GetGUIDLow())
-    if guid then S.PlayerProfiles[guid] = nil end
+    if guid then S.PlayerProfiles[guid], S.Creation[guid] = nil, nil end
 end
 
 local roles = {minion = true, lieutenant = true, boss = true}
@@ -244,6 +244,142 @@ local function Upsert(tableName, columns, values)
     end
     return "INSERT INTO `" .. tableName .. "` (" .. table.concat(names, ",") .. ") VALUES ("
         .. table.concat(encoded, ",") .. ") ON DUPLICATE KEY UPDATE " .. table.concat(updates, ",")
+end
+
+-- Creation state lives in character_rps_creation, apart from character_rps_stats: combat
+-- profiles keep loading when the creation schema is not applied yet. No row means 'none'.
+S.Creation = {}
+S.CreationStates = {none = true, legacy = true, reconfigure = true, complete = true}
+local MASTERY_COLUMNS = {"skill", "knowledge", "endurance", "craft"}
+
+-- rp_name stays in the table for compatibility: it is no longer read or written.
+function S.EmptyCreation(guid)
+    return {guid = guid, state = "none", catalogVersion = "", race = "", racialFeature = "",
+        archetype = "", traits = {}, traitChoice = "", mastery = {skill = 0, knowledge = 0, endurance = 0, craft = 0},
+        revision = 0, confirmedAt = 0, confirmedBy = "0", starterGranted = false, starterGrantedAt = 0,
+        racePresetVersion = 0}
+end
+
+-- race_preset_version comes from 2026_10_27_02; without it the version reads as 0 and is not saved.
+-- nil = not probed yet (or the probe failed and is retried on the next load).
+S.RacePresetColumn = nil
+function S.HasRacePresetColumn(query)
+    if S.RacePresetColumn == nil then
+        query = query or CharDBQuery
+        local q = type(query) == "function" and query([[SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'character_rps_creation'
+            AND COLUMN_NAME = 'race_preset_version']])
+        if not q then return false end
+        S.RacePresetColumn = q:GetUInt32(0) > 0
+    end
+    return S.RacePresetColumn
+end
+
+function S.LoadCreation(guid, query)
+    guid = C.IdString(guid)
+    if not guid or guid == "0" then return nil, "invalid_player" end
+    query = query or CharDBQuery
+    if type(query) ~= "function" then return nil, "character_query_unavailable" end
+    local count = query("SELECT COUNT(*) FROM character_rps_creation WHERE guid = " .. guid)
+    if not count then return nil, "creation_schema_unavailable" end
+    if count:GetUInt32(0) == 0 then return S.EmptyCreation(guid) end
+    local preset = S.HasRacePresetColumn(query)
+    local q = query([[SELECT creation_state, catalog_version, race_key, racial_feature_key, archetype_key,
+        trait_keys, trait_choice, mastery_skill, mastery_knowledge, mastery_endurance, mastery_craft,
+        revision, confirmed_at, confirmed_by, starter_granted, starter_granted_at]]
+        .. (preset and ", race_preset_version" or "") .. " FROM character_rps_creation WHERE guid = " .. guid)
+    if not q then return nil, "creation_query_failed" end
+    local rec = S.EmptyCreation(guid)
+    rec.state, rec.catalogVersion = q:GetString(0), q:GetString(1) or ""
+    rec.race, rec.racialFeature, rec.archetype = q:GetString(2) or "", q:GetString(3) or "", q:GetString(4) or ""
+    for key in (q:GetString(5) or ""):gmatch("[^,]+") do rec.traits[#rec.traits + 1] = key end
+    rec.traitChoice = q:GetString(6) or ""
+    for i, key in ipairs(MASTERY_COLUMNS) do rec.mastery[key] = q:GetUInt8(6 + i) end
+    rec.revision, rec.confirmedAt = q:GetUInt32(11), q:GetUInt32(12)
+    rec.confirmedBy, rec.starterGranted = C.IdString(q:GetUInt64(13)) or "0", q:GetUInt8(14) == 1
+    rec.starterGrantedAt = q:GetUInt32(15)
+    rec.racePresetVersion = preset and q:GetUInt32(16) or 0
+    if not C.Integer(rec.racePresetVersion, 0, 4294967295) then return nil, "invalid_creation_record" end
+    if not S.CreationStates[rec.state] or not C.Integer(rec.revision, 0, 4294967295) then
+        return nil, "invalid_creation_record"
+    end
+    for _, key in ipairs(MASTERY_COLUMNS) do
+        if not C.Integer(rec.mastery[key], 0, 255) then return nil, "invalid_creation_record" end
+    end
+    return rec
+end
+
+function S.GetOrLoadCreation(guid, query)
+    guid = C.IdString(guid)
+    if guid and S.Creation[guid] then return S.Creation[guid] end
+    local rec, err = S.LoadCreation(guid, query)
+    if rec then S.Creation[guid] = rec end
+    return rec, err
+end
+
+function S.CopyCreation(rec)
+    local copy = Copy(rec)
+    copy.traits = {}; for i, key in ipairs(rec.traits or {}) do copy.traits[i] = key end
+    return copy
+end
+
+function S.BuildCreationSave(rec)
+    local id = C.IdString(rec and rec.guid)
+    if not id or id == "0" or not S.CreationStates[rec.state] or not C.Integer(rec.revision, 0, 4294967295)
+        or not C.Integer(rec.confirmedAt or 0, 0, 4294967295) or not C.Integer(rec.starterGrantedAt or 0, 0, 4294967295) then
+        return nil, "invalid_creation_record"
+    end
+    local values = {id, Quote(rec.state, 16), Quote(rec.catalogVersion or "", 64), Quote(rec.race or "", 32), Quote(rec.racialFeature or "", 64), Quote(rec.archetype or "", 32),
+        Quote(table.concat(rec.traits or {}, ","), 255), Quote(rec.traitChoice or "", 32)}
+    for _, key in ipairs(MASTERY_COLUMNS) do
+        local value = C.Integer(rec.mastery and rec.mastery[key] or 0, 0, 255)
+        if not value then return nil, "invalid_creation_record" end
+        values[#values + 1] = tostring(value)
+    end
+    values[#values + 1] = tostring(rec.revision)
+    values[#values + 1] = tostring(rec.confirmedAt or 0)
+    values[#values + 1] = C.IdString(rec.confirmedBy or "0")
+    values[#values + 1] = rec.starterGranted and "1" or "0"
+    values[#values + 1] = tostring(rec.starterGrantedAt or 0)
+    local columns = {"guid", "creation_state", "catalog_version", "race_key",
+        "racial_feature_key", "archetype_key", "trait_keys", "trait_choice", "mastery_skill", "mastery_knowledge",
+        "mastery_endurance", "mastery_craft", "revision", "confirmed_at", "confirmed_by", "starter_granted",
+        "starter_granted_at"}
+    if S.HasRacePresetColumn() then
+        local version = C.Integer(rec.racePresetVersion or 0, 0, 4294967295)
+        if not version then return nil, "invalid_creation_record" end
+        columns[#columns + 1], values[#values + 1] = "race_preset_version", tostring(version)
+    end
+    return Upsert("character_rps_creation", columns, values)
+end
+
+-- entry = {guid, revision, action, fromState, toState, actorGuid, requestId, reason, snapshotJson, createdAt}
+function S.BuildCreationLog(entry)
+    local guid, actor = C.IdString(entry.guid), C.IdString(entry.actorGuid)
+    local values = {guid, tostring(C.Integer(entry.revision, 0, 4294967295) or ""), Quote(entry.action, 16),
+        Quote(entry.fromState, 16), Quote(entry.toState, 16), actor, Quote(entry.requestId, 80),
+        Quote(entry.reason or "", 255), Quote(entry.snapshotJson or "{}", 1048576),
+        tostring(C.Integer(entry.createdAt, 0, 4294967295) or "")}
+    for i = 1, 10 do if not values[i] or values[i] == "" then return nil, "invalid_creation_log" end end
+    return "INSERT INTO `character_rps_creation_log` (`guid`,`revision`,`action`,`from_state`,`to_state`,"
+        .. "`actor_guid`,`request_id`,`reason`,`snapshot_json`,`created_at`) VALUES (" .. table.concat(values, ",") .. ")"
+end
+
+-- items = {{key, kind, quality, slot?, stack?}}; every row goes to the RP storage location.
+function S.BuildStarterItems(guid, items, createdAt)
+    local id = C.IdString(guid)
+    if not id or id == "0" or type(items) ~= "table" or #items > 255 then return nil, "invalid_starter_items" end
+    if #items == 0 then return {} end
+    local rows = {}
+    for i, item in ipairs(items) do
+        local key, kind, quality = Quote(item.key, 64), Quote(item.kind, 16), Quote(item.quality or "simple", 16)
+        local stack = C.Integer(item.stack or 1, 1, 65535)
+        if not key or not kind or not quality or not stack then return nil, "invalid_starter_items" end
+        rows[i] = "(" .. table.concat({id, key, kind, quality, "'storage'", Quote(item.slot or "", 16) or "''",
+            tostring(stack), "'starter'", tostring(i), tostring(createdAt or 0)}, ",") .. ")"
+    end
+    return {"INSERT INTO `character_rps_items` (`owner_guid`,`item_key`,`item_kind`,`quality`,`location`,`slot`,"
+        .. "`stack`,`source`,`starter_slot`,`created_at`) VALUES " .. table.concat(rows, ",")}
 end
 
 function S.BuildSave(profile)

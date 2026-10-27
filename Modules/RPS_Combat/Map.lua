@@ -3,12 +3,22 @@ if _G.NN_RPS_MAP_LOADED then return end
 _G.NN_RPS_MAP_LOADED=true
 local C=require("Modules.RPS_Combat.00_RPS_Config")
 local loaded=C.LoadStatDefinitions()
+C.RefreshActionSpells()
 RegisterPlayerEvent(5,function(_,player,spell)
-    if not spell or not C.SpellToStatKey[spell:GetEntry()] then return end
+    if not spell then return end
+    local entry=spell:GetEntry()
+    if not C.SpellToStatKey[entry] and not C.SpellToActionKey[entry] then return end
     -- Only the MAP state touches the transient Spell. The WORLD sees IDs only.
-    if RpsQueueDiceCast then RpsQueueDiceCast(player,spell) end
+    local queued,why=false,"no_binding"
+    if RpsQueueDiceCast then queued,why=RpsQueueDiceCast(player,spell) end
     spell:Cancel()
+    if not queued then
+        player:SendNotification(why=="cast_pending" and "Предыдущий бросок ещё обрабатывается"
+            or why=="queue_full" and "Очередь бросков переполнена" or "Бросок недоступен")
+    end
 end)
 -- An absent startup schema requires the normal post-install Eluna reload;
 -- avoid emitting missing-table SQL errors every ten seconds in every MAP.
-CreateLuaEvent(function() if loaded then C.LoadStatDefinitions() end end,10000,0)
+CreateLuaEvent(function() if loaded then C.LoadStatDefinitions(); C.RefreshActionSpells() end end,10000,0)
+local progressionOk,progressionErr=pcall(function() require("Modules.RPS_Combat.06_RPS_Progression").InstallMap() end)
+if not progressionOk then print("[NobleNext RPS MAP] progression: "..tostring(progressionErr)) end
