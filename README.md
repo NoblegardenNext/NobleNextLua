@@ -11,6 +11,10 @@
 | **GM** | `GM/` | Инструменты GM/DM: Army, Master, Waypoints, POI, … |
 | **Modules** | `Modules/` | Общий геймплей: Housing, AutoMount |
 
+Система 3d6: WORLD bootstrap
+регистрирует AIO и подтверждённую запись, MAP bootstrap передаёт спеллы-кубы через
+native очередь GUID. Модуль остаётся неактивным без соответствующих схем и bindings.
+
 Точка входа — только `00_NobleNext.lua`. Init-модули в подпапках не регистрируют события сами.
 
 ## C++ vs Lua (2026)

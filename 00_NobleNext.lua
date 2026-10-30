@@ -17,6 +17,13 @@ end
 _G.NN_ENTRY_LOADED = true
 
 local AIO = AIO or require("AIO")
+if GetStateMapId() ~= -1 then
+    _G.NN_BOOTSTRAP_ACTIVE = true
+    local ok, err = pcall(require, "Modules.RPS_Combat.Map")
+    _G.NN_BOOTSTRAP_ACTIVE = false
+    if not ok then print("[NobleNext RPS MAP] " .. tostring(err)) end
+    return
+end
 if not AIO.IsMainState() then
     return
 end
@@ -29,6 +36,7 @@ local NobleNext = require("NobleNext")
 
 local MODULES = {
     "Core.NNCoreInit",
+    "Modules.RPS_Combat.Init",
     "GM.NNGmInit",
     "Modules.NNModulesInit",
     "GM.Status.NNStatusInit",
