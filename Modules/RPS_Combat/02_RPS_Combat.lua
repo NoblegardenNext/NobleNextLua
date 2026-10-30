@@ -5,12 +5,14 @@ local S = require("Modules.RPS_Combat.01_RPS_Storage")
 local M = {}
 
 function M.SpendEnergy(profile, cost)
-    if type(profile) ~= "table" or not C.Integer(cost, 0, C.MAX_ENERGY_PER_ROUND)
+    if type(profile) ~= "table" then return nil, "invalid_budget" end
+    local limit = profile.energySpendLimit == nil and C.MAX_ENERGY_PER_ROUND or profile.energySpendLimit
+    if not C.Integer(cost, 0, 1000) or not C.Integer(limit, 0, 1000)
         or not C.Integer(profile.maxEnergy, 0, C.MAX_RESOURCE)
         or not C.Integer(profile.curEnergy, 0, C.MAX_RESOURCE)
-        or not C.Integer(profile.energySpentRound, 0, C.MAX_ENERGY_PER_ROUND) then return nil, "invalid_budget" end
+        or not C.Integer(profile.energySpentRound, 0, 1000) then return nil, "invalid_budget" end
     if profile.curEnergy < cost then return nil, "insufficient_energy" end
-    if profile.energySpentRound + cost > C.MAX_ENERGY_PER_ROUND then return nil, "round_budget_exhausted" end
+    if cost > 0 and profile.energySpentRound + cost > limit then return nil, "round_budget_exhausted" end
     local draft = S.CopyProfile(profile)
     draft.curEnergy = draft.curEnergy - cost
     draft.energySpentRound = draft.energySpentRound + cost
@@ -57,8 +59,8 @@ function M.ExecuteStatRoll(profile, statKey, useFateDie, rng, fatigueStacks)
     return draft, roll
 end
 
--- Physical armor and an allowed block are applied once. A wound is a transition
--- from positive RP health to zero, not another wound for every hit at zero health.
+-- Every new positive hit ending at zero health adds a wound. Request replay is
+-- handled by the operation journal, not by suppressing hits on an already downed unit.
 function M.ApplyDamageToUnit(profile, rawDamage, damageType, blockMitigation, rng)
     if type(profile) ~= "table" or not C.Integer(profile.curHealth, 0, C.MAX_RESOURCE)
         or not C.Integer(profile.maxHealth, 1, C.MAX_RESOURCE)
@@ -72,7 +74,7 @@ function M.ApplyDamageToUnit(profile, rawDamage, damageType, blockMitigation, rn
     local damage = math.max(0, rawDamage - mitigation)
     draft.curHealth = math.max(0, draft.curHealth - damage)
     local result = {rawDamage = rawDamage, mitigation = mitigation, damage = damage, woundAdded = false}
-    if draft.isPlayer and profile.curHealth > 0 and draft.curHealth == 0 then
+    if draft.isPlayer and damage > 0 and draft.curHealth == 0 then
         draft.curWounds = draft.curWounds + 1
         result.woundAdded = true
         if draft.curWounds >= draft.maxWounds then
@@ -209,6 +211,8 @@ function M.BuildUnitSyncPayload(unit, canEdit)
         curEnergy         = tStats.curEnergy or 0,
         maxEnergy         = math.max(0, tStats.maxEnergy or 0),
         energySpentRound  = tStats.energySpentRound or 0,
+        energySpendLimit  = tStats.energySpendLimit or C.MAX_ENERGY_PER_ROUND,
+        healDifficulty    = tStats.healDifficulty or C.DEFAULT_HEAL_DIFFICULTY,
         curWounds         = tStats.curWounds or 0,
         maxWounds         = tStats.maxWounds or 3,
         armor             = tStats.armor or 0,

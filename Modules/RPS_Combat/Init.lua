@@ -97,7 +97,7 @@ end
 local function Public(p)
     local out = {}
     for _, k in ipairs({"guid","runtimeGuid","isPlayer","name","roleType","isStaticThreshold","curHealth","maxHealth",
-        "curEnergy","maxEnergy","energySpentRound","curWounds","maxWounds","armor","speed","weaponDice","blockDice",
+        "curEnergy","maxEnergy","energySpentRound","energySpendLimit","healDifficulty","curWounds","maxWounds","armor","speed","weaponDice","blockDice",
         "revision","deathOutcome","archetype","raceId","level"}) do out[k]=p[k] end
     out.stats={}; for k, v in pairs(p.stats) do if C.StatDefs[k] then out.stats[k]=v end end
     if p.isPlayer then
@@ -109,6 +109,7 @@ local function Public(p)
 end
 function R.SyncPlayerState(player)
     local p = S.PlayerProfiles[Id(player)]
+    if p and S.WithEquipment then p = S.WithEquipment(player, p) end
     local pending={}
     for id,a in pairs(R.PendingAttacks) do if a.defenderGuid==Id(player) then pending[#pending+1]=id end end
     if p then AIO.Handle(player,prefix,"SyncProfile",{protocol=1,registry=C.StatOrder,profile=Public(p),pendingAttackIds=pending,
@@ -129,7 +130,7 @@ function R.SyncTargetState(player, targetUnit)
 end
 local function Ensure(player, callback)
     local p, err = S.GetOrLoadPlayerProfile(player)
-    if p then callback(p); return end
+    if p then callback(S.WithEquipment and S.WithEquipment(player,p) or p); return end
     if err~="profile_missing_or_query_failed" then callback(nil,err); return end
     local guid, locator=Id(player),player:GetGUID()
     local count=CharDBQuery("SELECT COUNT(*) FROM character_rps_stats WHERE guid="..guid)
@@ -141,7 +142,7 @@ local function Ensure(player, callback)
         R.Locks["p:"..guid]=nil
         local current=Player(locator)
         if not current then return end
-        callback(ok and S.PlayerProfiles[guid] or nil,why)
+        callback(ok and S.ResolveUnitStats(current) or nil,why)
     end)
 end
 local function NotifyPending(player)
@@ -224,9 +225,9 @@ local Escape=require("Core.DB").EscapeSqlString
 local function Q(value) return "'"..Escape(value or "").."'" end
 local function ReceiptSql(playerId,requestId,record,result,state)
     return string.format([[INSERT INTO rps_action_receipts
-        (issuer_guid,request_id,signature,state,result_kind,stat_key,total,damage,attack_id)
-        VALUES (%s,%s,%s,%s,%s,%s,%d,%d,%s)]],playerId,Q(requestId),Q(record.signature),Q(state),
-        Q(result.kind),Q(result.statKey),result.total or 0,result.damage or 0,Q(result.attackId))
+        (issuer_guid,request_id,signature,state,result_kind,stat_key,total,damage,attack_id,result_payload)
+        VALUES (%s,%s,%s,%s,%s,%s,%d,%d,%s,%s)]],playerId,Q(requestId),Q(record.signature),Q(state),
+        Q(result.kind),Q(result.statKey),result.total or 0,result.damage or 0,Q(result.attackId),Q(assert(S.EncodeReceipt(result))))
 end
 local function Rate(player)
     local key=Id(player)
@@ -234,42 +235,58 @@ local function Rate(player)
     if ticks[key] and now>=ticks[key] and now-ticks[key]<400 then Error(player,"rate_limited"); return false end
     ticks[key]=now; return true
 end
-local function Begin(player, requestId, signature, profiles)
-    if type(signature)~="string" or #signature>8192 then Error(player,"invalid_message"); return end
+local function ValidRequest(player,requestId)
     if type(requestId)~="string" or #requestId<1 or #requestId>80 or not requestId:match("^[%w_-]+$") then
-        Error(player,"invalid_request_id"); return
+        Error(player,"invalid_request_id"); return false
+    end
+    return true
+end
+-- Lookup precedes mutable target, revision and pending-attack checks. Legacy
+-- attack callers did not carry a target GUID; their unchanged envelope replays
+-- the original implicit target rather than the current selection.
+local function Replay(player,requestId,signature,pool,allowSuffix)
+    if not ValidRequest(player,requestId) then return true end
+    local function Matches(stored)
+        return stored==signature or (allowSuffix and stored:sub(1,#signature)==signature)
     end
     local key=Id(player)
     local seen=R.Seen[key] or {}; R.Seen[key]=seen
     if seen[requestId] then
         local prior=seen[requestId]
-        if prior.signature~=signature then Error(player,"request_conflict",requestId)
+        if not Matches(prior.signature) then Error(player,"request_conflict",requestId)
         elseif prior.done then
             if prior.error then Error(player,prior.error,requestId) else
                 Refresh(player); AIO.Handle(player,prefix,"Committed",{requestId=requestId,result=prior.result})
             end
         else Error(player,"request_pending",requestId) end
-        return
+        return true
     end
+    local query=pool=="characters" and CharDBQuery or WorldDBQuery
+    local where=" WHERE issuer_guid="..key.." AND request_id="..Q(requestId)
+    local countQuery=query("SELECT COUNT(*) FROM rps_action_receipts"..where)
+    if not countQuery then Error(player,"receipt_unavailable",requestId); return true end
+    if countQuery:GetUInt32(0)==0 then return false end
+    local q=query("SELECT signature,state,result_payload FROM rps_action_receipts"..where)
+    if not q then Error(player,"receipt_unavailable",requestId); return true end
+    if not Matches(q:GetString(0)) then Error(player,"request_conflict",requestId); return true end
+    if q:GetString(1)~="done" then Error(player,"pending_recovery",requestId); return true end
+    local result,why=S.DecodeReceipt(q:GetString(2))
+    if not result then Error(player,why,requestId); return true end
+    Refresh(player)
+    AIO.Handle(player,prefix,"Committed",{requestId=requestId,result=result})
+    return true
+end
+local function Begin(player, requestId, signature, profiles)
+    if type(signature)~="string" or #signature>8192 then Error(player,"invalid_message"); return end
+    if not ValidRequest(player,requestId) then return end
+    local key=Id(player)
+    local seen=R.Seen[key] or {}; R.Seen[key]=seen
     local receiptPool="characters"
     if #profiles>0 then
         receiptPool="world"
         for _,p in ipairs(profiles) do if p.isPlayer then receiptPool="characters"; break end end
     end
-    local query=receiptPool=="characters" and CharDBQuery or WorldDBQuery
-    local where=" WHERE issuer_guid="..key.." AND request_id="..Q(requestId)
-    local countQuery=query("SELECT COUNT(*) FROM rps_action_receipts"..where)
-    if not countQuery then Error(player,"receipt_unavailable",requestId); return end
-    if countQuery:GetUInt32(0)>0 then
-        local q=query("SELECT signature,state,result_kind,stat_key,total,damage,attack_id FROM rps_action_receipts"..where)
-        if not q then Error(player,"receipt_unavailable",requestId); return end
-        if q:GetString(0)~=signature then Error(player,"request_conflict",requestId); return end
-        if q:GetString(1)~="done" then Error(player,"pending_recovery",requestId); return end
-        Refresh(player)
-        AIO.Handle(player,prefix,"Committed",{requestId=requestId,result={kind=q:GetString(2),statKey=q:GetString(3),
-            total=q:GetInt32(4),damage=q:GetInt32(5),attackId=q:GetString(6)}})
-        return
-    end
+    if Replay(player,requestId,signature,receiptPool) then return end
     local keys={}
     for _, p in ipairs(profiles) do keys[Actor(p)]=true end
     for k in pairs(keys) do if R.Locks[k] then Error(player,"actor_busy",requestId); return end end
@@ -351,10 +368,11 @@ function R.Roll(player,statKey,fate,requestId,revision)
     if not Guard(player,requestId) then return end
     if not C.ValidStatKey(statKey) or not C.StatDefs[statKey] or type(fate)~="boolean"
         or not C.Integer(revision,0,4294967295) then Error(player,"invalid_roll",requestId); return end
+    local signature="roll:"..statKey..":"..tostring(fate)..":"..tostring(revision)..":"
+    if Replay(player,requestId,signature,"characters") then return end
     if not Rate(player) then return end
     local p=S.PlayerProfiles[Id(player)]
     if not p then Error(player,"profile_unavailable",requestId); return end
-    local signature="roll:"..statKey..":"..tostring(fate)..":"..tostring(revision)..":"
     local record=Begin(player,requestId,signature,{p}); if not record then return end
     if revision~=p.revision then Abort(player,requestId,record,"stale_profile"); return end
     local draft,roll=M.ExecuteStatRoll(p,statKey,fate,nil,p.stats.debuff_fatigue or 0)
@@ -368,16 +386,25 @@ function R.Roll(player,statKey,fate,requestId,revision)
 end
 
 -- Explicit attack: PvP creates one pending attack with a 30 s window; an NPC defends at once.
-function R.Attack(player,fate,requestId,revision)
+function R.Attack(player,fate,requestId,revision,targetGuid)
     if not Guard(player,requestId) then return end
     local statKey=C.Actions.attack.statKey
     if type(fate)~="boolean" or not C.Integer(revision,0,4294967295) or not C.StatDefs[statKey] then
         Error(player,"invalid_action",requestId); return
     end
+    local envelope="attack:"..tostring(fate)..":"..tostring(revision)..":"
+    if targetGuid~=nil then
+        targetGuid=NormalizeWireGuid(targetGuid)
+        if not targetGuid then Error(player,"invalid_target",requestId); return end
+    end
+    if Replay(player,requestId,envelope..(targetGuid or ""),"characters",targetGuid==nil) then return end
     if not Rate(player) then return end
     local p=S.PlayerProfiles[Id(player)]
     if not p then Error(player,"profile_unavailable",requestId); return end
     local target=Target(player)
+    if targetGuid and (not target or NormalizeWireGuid(target:GetGUID())~=targetGuid) then
+        Error(player,"target_changed",requestId); return
+    end
     if target and tostring(target:GetGUID())==tostring(player:GetGUID()) then target=nil end
     if not target then
         player:SendNotification("Атака: выберите цель")
@@ -385,13 +412,13 @@ function R.Attack(player,fate,requestId,revision)
     end
     local tp,err=S.ResolveUnitStats(target)
     if not tp then Error(player,err or "target_outside_system",requestId); return end
+    local signature=envelope..(targetGuid or Actor(tp))
+    local record=Begin(player,requestId,signature,{p,tp}); if not record then return end
     if tp.isPlayer then
         for _,a in pairs(R.PendingAttacks) do
-            if a.attackerGuid==p.guid and a.defenderGuid==tp.guid then Error(player,"attack_pending",requestId); return end
+            if a.attackerGuid==p.guid and a.defenderGuid==tp.guid then Abort(player,requestId,record,"attack_pending"); return end
         end
     end
-    local signature="attack:"..tostring(fate)..":"..tostring(revision)..":"..Actor(tp)
-    local record=Begin(player,requestId,signature,{p,tp}); if not record then return end
     if revision~=p.revision then Abort(player,requestId,record,"stale_profile"); return end
     local draft,roll=M.ExecuteStatRoll(p,statKey,fate,nil,p.stats.debuff_fatigue or 0)
     if not draft then Abort(player,requestId,record,roll); return end
@@ -443,13 +470,11 @@ function R.React(player,attackId,choice,statKey,fate,requestId)
         or (statKey~=nil and statKey~="evasion" and statKey~="resistance") or type(fate)~="boolean" then
         Error(player,"invalid_reaction",requestId); return
     end
-    if not Rate(player) then return end
     local signature="react:"..attackId..":"..tostring(choice)..":"..tostring(statKey)..":"..tostring(fate)
+    if Replay(player,requestId,signature,"characters") then return end
+    if not Rate(player) then return end
     local a=R.PendingAttacks[attackId]
     if not a or a.defenderGuid~=Id(player) then
-        -- A replayed request returns its stored receipt; any other answer to a closed attack is refused.
-        local seen=R.Seen[Id(player)]
-        if a==nil and type(requestId)=="string" and seen and seen[requestId] then Begin(player,requestId,signature,{}); return end
         Error(player,"reaction_unavailable",requestId); return
     end
     if a.busy then Error(player,"request_pending",requestId); return end
@@ -525,7 +550,7 @@ function R.PerformAction(player,actionKey,args,requestId)
         or (args.attackId~=nil and type(args.attackId)~="string") then
         Error(player,"invalid_action",requestId); return
     end
-    if action.kind=="attack" then return R.Attack(player,args.fate==true,requestId,args.revision) end
+    if action.kind=="attack" then return R.Attack(player,args.fate==true,requestId,args.revision,args.targetGuid) end
     if args.fate and action.choice~="AVOID" then Error(player,"invalid_fate_choice",requestId); return end
     local attackId=args.attackId
     if attackId==nil then
@@ -674,6 +699,8 @@ H.PerformAction=R.PerformAction
 H.DmSaveTargetStats=R.DmSave
 require("Modules.RPS_Combat.05_RPS_Creation").Register(R,H,Ensure)
 require("Modules.RPS_Combat.06_RPS_Progression").InstallWorld(R,H)
+R.Items = require("Modules.RPS_Combat.07_RPS_Items").Install(R,H)
+R.Consumables = require("Modules.RPS_Combat.09_RPS_Consumables").InstallWorld(R,H)
 
 local function Load()
     R.unavailableReason=nil
@@ -699,9 +726,10 @@ local function Load()
     end
     ok,why=S.LoadNpcCaches()
     if not ok then return Fail(why or "npc_cache_unavailable") end
+    for _,problem in ipairs(R.Items.LoadDefinitions()) do N.Log("RPS_Combat","item_definition_skipped:"..problem) end
     if not ok or not WorldDBQuery("SELECT COUNT(*) FROM rps_creature_runtime_stats")
-        or not WorldDBQuery("SELECT COUNT(*) FROM rps_action_receipts")
-        or not CharDBQuery("SELECT COUNT(*) FROM rps_action_receipts") then return Fail("runtime_or_receipts_schema_unavailable") end
+        or not WorldDBQuery("SELECT COUNT(result_payload) FROM rps_action_receipts")
+        or not CharDBQuery("SELECT COUNT(result_payload) FROM rps_action_receipts") then return Fail("runtime_or_receipts_schema_unavailable") end
     -- Empty SELECT cannot report success, so validate columns through COUNT.
     if not CharDBQuery("SELECT COUNT(revision),COUNT(death_outcome) FROM character_rps_stats") then return Fail("character_profile_schema_unavailable") end
     local count=CharDBQuery("SELECT COUNT(*) FROM rps_pending_attacks")
@@ -767,12 +795,14 @@ function R.DiagSpells(player)
     return lines
 end
 RegisterPlayerEvent(3,function(_,player)
+    R.Consumables.Recover(player)
     if not R.ready then return end
     R.IssueSpells(player,true)
     H.RequestSync(player)
 end)
 RegisterPlayerEvent(4,function(_,player)
     local key=Id(player)
+    R.Items.Release(player)
     if not R.Locks["p:"..key] then S.ReleasePlayer(player) end
     R.SpellStatuses[key],R.LearnFailed[key]=nil,nil
     R.ActionSpellStatuses[key],R.LastReaction[key]=nil,nil
@@ -780,6 +810,10 @@ RegisterPlayerEvent(4,function(_,player)
     readTicks[key..":self"],readTicks[key..":target"],readTicks[key..":units"]=nil,nil,nil
 end)
 RegisterPlayerEvent(42,function(_,player,command)
+    if player then
+        local handled = R.Items.Command(player,command)
+        if handled == false then return false end
+    end
     -- Never swallow the existing .rps character / npc command trees.
     local key,value=command:match("^rps setstat ([a-z][a-z0-9_]*) (%-?%d+)$")
     if key then
@@ -831,6 +865,7 @@ CreateLuaEvent(function()
         end
     end
     for _,p in ipairs(GetPlayersInWorld()) do
+        R.Items.PollPlayer(p)
         for _,a in pairs(R.PendingAttacks) do
             if a.record and a.record.done and a.record.error then a.busy,a.record=nil,nil end
             if a.defenderGuid==Id(p) and os.time()>=a.expiresAt and not a.busy and not R.Locks["p:"..Id(p)] then

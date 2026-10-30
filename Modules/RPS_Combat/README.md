@@ -44,7 +44,7 @@ SQL подготовлен отдельно для `world` и `characters` в `R
 
 Кандидат для десяти спеллов — **1500001–1500010**, в порядке accuracy, healing, evasion, resistance, skill, knowledge, endurance, craft, weapon_damage, shield_block. В локальных CSV максимум ID `SpellName/Spell` равен 1327777, `SpellEffect` — 1366434, `SpellMisc` — 873077. Выбранный диапазон превышает каждый из этих максимумов более чем на 100000.
 
-Seed оставляет `spell_id = 0`, пока не подготовлены client/server records. Ненулевой ID проходит серверную проверку наличия и NONE/DUMMY effects через `RpsDiceSpellStatus` (fallback `RpsIsDiceSpell`). MAP отменяет такой каст и кладёт GUID/spell ID в ограниченную очередь. WORLD заново находит игрока, проверяет карту, instance, цель и срок события.
+Seed оставляет `spell_id = 0`, пока не подготовлены client/server records. Ненулевой ID проходит серверную проверку наличия и NONE/DUMMY effects через `RpsDiceSpellStatus` (fallback `RpsIsDiceSpell`). MAP кладёт GUID/spell ID в ограниченную очередь и при успехе вызывает `Spell:Finish()`. В текущем ядре finished-cast не доходит до native effects; безусловный `Cancel()` здесь отправлял бы ложное «Прервано». WORLD заново находит игрока, проверяет карту, instance, цель и срок события. Завершение native оболочки означает только приём в очередь, не успешное сохранение RP-результата.
 
 ### Выдача и статусы
 
@@ -84,7 +84,7 @@ Seed оставляет `spell_id = 0`, пока не подготовлены c
 wsl -d Ubuntu-22.04 -- bash -lc 'cd /mnt/f/Projects/RP-S.Projects/RPS-eXtended/RPS.TrinityCore/Addons/tests && python3 -m unittest -v test_rps_combat_foundation test_rps_combat_integration test_rps_combat_client test_rps_combat_actions'
 ```
 
-Тесты используют существующий Lua harness и `liblua5.3`, проверяют задержанный callback, отказ, блокировки, восстановление receipts/pending, разделение NPC и клиентскую очередь. Каталог `Addons/tests` исключён существующим `.gitignore` и не входит в поставку. Native bindings проверяются BuildOnly. Применение SQL, фактические Eluna hooks и поведение игрового клиента требуют отдельного стенда.
+Тесты используют Lua harness и liblua5.3. RPS-файлы и fixtures теперь разрешены отдельным allowlist в Addons/.gitignore; остальные локальные тесты и caches остаются исключены. Проверяются задержанные callbacks, отказ intent/финальной записи, восстановление после потери памяти, полный replay и клиентский запрос XP. SQLite проверяет атомарность emitted SQL при отказе каждого UPDATE, не заменяя MySQL/Eluna стенд. Native bindings проверяются BuildOnly.
 
 ## Диагностика готовности
 
@@ -133,8 +133,8 @@ wsl -d Ubuntu-22.04 -- bash -lc 'cd /mnt/f/Projects/RP-S.Projects/RPS-eXtended/R
 |---|---|---|
 | `none` | Нет строки `character_rps_creation` (профиль создан после миграции) | Первое создание: ОЗ/ОЭ = максимум |
 | `legacy` | Профиль существовал до миграции (backfill SQL) | Один раз; текущие ОЗ/ОЭ, Раны, XP, кости, equip/effects JSON сохраняются |
-| `reconfigure` | Разрешено ведущим (`scope = 'full'`) или после сброса расы (`scope = 'race'`) | Пересчёт без лечения и без повторного старта; в `scope = 'race'` меняются только раса и особенность |
-| `complete` | Выбор подтверждён | `already_configured`; изменение только через ведущего или сброс расы |
+| `reconfigure` | Разрешено ведущим (`scope = 'full'`), после сброса расы (`scope = 'race'`) или смены архетипа игроком (`scope = 'archetype'`) | Пересчёт без лечения и без повторного старта; в `scope = 'race'` меняются только раса и особенность, в `scope = 'archetype'` — только архетип |
+| `complete` | Выбор подтверждён | `already_configured`; изменение через ведущего, сброс расы или платную смену архетипа |
 
 RP-имя на сервере не хранится и не проверяется (имена в TotalRP): `draft.rpName` старого клиента игнорируется, колонка `rp_name` остаётся в таблице для совместимости и не пишется.
 
@@ -150,15 +150,19 @@ RP-имя на сервере не хранится и не проверяетс
 | `CharacterReconfigured` | сервер → ведущему | `{requestId, targetGuid, revision, state}`; цели — `SyncProfile` и notification |
 | `ResetRaceData(requestId)` | клиент → сервер | Сброс расы самим игроком: только `complete` и `raceUpdateAvailable` (сохранённая `race_preset_version` < `presetVersion` расы), иначе `race_preset_current` |
 | `RaceDataReset` | сервер → инициатору | `{requestId, targetGuid, revision, state='reconfigure', scope='race'}`; цели — `SyncProfile` (и notification, если сбросил ведущий) |
+| `ResetArchetype(expectedCost, requestId)` | клиент → сервер | Смена архетипа самим игроком: только `complete`; `expectedCost` — цена в меди, которую показал клиент; иная цена сервера — `archetype_reset_cost_changed` и новый `SyncProfile` |
+| `ArchetypeReset` | сервер → игроку | `{requestId, revision, state='reconfigure', scope='archetype', cost}`, затем `SyncProfile` |
 | `CharacterError` | сервер → клиент | `{code, message_ru, requestId?, errors?}` |
 
 `missing` в `CharacterPreview` (только при `ok=false`, порядок мастера): `race`/`racialFeature` (шаг `race`), `trait`/`traitChoice` (шаг `trait`), `mastery` с `left` — сколько очков не распределено (шаг `mastery`), `archetype` (шаг `archetype`), `starterItems` с `optional=true` (шаг `starter`, выбор необязателен). Ошибки выбранных, но неверных значений остаются в `errors`; при заполненном черновике с ошибками `missing` пуст.
 
-`SyncProfile.creation` и `state` опций: `scope` (`race`/`full`/нет; выводится из записи: `reconfigure` с пустой расой = `race`), `raceUpdateAvailable` (bool), `racePresetVersion` (сохранённая версия; 0 без колонки).
+`SyncProfile.creation` и `state` опций: `scope` (`race`/`archetype`/`full`/нет; выводится из записи: `reconfigure` с пустой расой = `race`, с пустым архетипом = `archetype`), `raceUpdateAvailable` (bool), `racePresetVersion` (сохранённая версия; 0 без колонки). Только в `SyncProfile.creation` при `complete`: `archetypeResetCost` — цена следующей смены архетипа в меди (нет поля — смена недоступна или журнал не читается).
+
+Смена архетипа игроком (`ResetArchetype`, D32): первая бесплатно, каждая следующая на 5 серебра дороже (500 меди × число прошлых смен: 0, 5, 10, 15 с. …). Прошлые смены считаются по `character_rps_creation_log` с `action='reconfigure'` и `reason='archetype_reset'` (кэш в памяти на персонажа); смены ведущим и сброс расы не считаются. Сброс очищает `archetype_key`, ставит `reconfigure` (`scope='archetype'`), пишет лог (снимок `{scope, cost, resetNumber, before}`) и receipt `archetype_reset` (`issuer_guid` = игрок); лист, ресурсы, остальной выбор и флаг старта не меняются. Деньги списываются штатным `ModifyMoney` до commit; при неудачном commit возвращаются, если игрок в сети (иначе `N.Log` `archetype_reset_refund_lost`). Следующий `ConfirmCharacter` в `scope='archetype'` принимает только архетип (`archetype_scope_only`, Мастерство неизменно). Отказы: `not_configured`, `already_reconfigure`, `archetype_reset_cost_changed`, `not_enough_money`, `actor_busy`, `save_failed`, `creation_unavailable`.
 
 Сброс расы: `.rps race reset [имяИгрока] [причина]` — staff (`N.HasStaffPermission`), без имени — выбранный игрок; имя ищется среди онлайн, затем в `characters` (offline). Обработчик — Eluna event 42 (C++-таблицы `.rps` не содержат подкоманды `race`). Игрок — `ResetRaceData`, только после обновления пресета его расы. Сброс очищает `race_key`/`racial_feature_key`, ставит `reconfigure` (`scope='race'`), пишет `character_rps_creation_log` (`action='reconfigure'`, `reason='race_reset[: причина]'`, снимок с `scope`) и receipt `race_reset`; лист, ресурсы, остальной выбор и флаг старта не меняются. Следующий `ConfirmCharacter` в `scope='race'` принимает только расу и особенность (`race_scope_only`); Мастерство можно перераспределить, лишь если сохранённая сумма не совпадает с бюджетом новой особенности (свободное очко Таурена). Подтверждение записывает `race_preset_version = presetVersion` выбранной расы. Без колонки (`2026_10_27_02_rps_race_preset.sql` не применён) версия читается как 0, не пишется, а сброс игроком отвечает `creation_unavailable`; staff-сброс работает.
 
-Коды отказа: коды `V.Validate`, а также `race_scope_only`, `race_preset_current`, `invalid_starter`, `too_many_items`, `unknown_item`, `invalid_quality` (только `starterAllowed`), `invalid_draft`, `revision_conflict`, `already_configured`, `request_conflict`, `request_pending`, `request_window_full`, `rate_limited`, `actor_busy`, `save_failed`, `partial_commit`, `permission_denied`, `invalid_reason`, `target_not_found`, `not_configured`, `already_reconfigure`, `creation_unavailable`, `receipt_unavailable`, `system_unavailable`.
+Коды отказа: коды `V.Validate`, а также `race_scope_only`, `archetype_scope_only`, `race_preset_current`, `archetype_reset_cost_changed`, `not_enough_money`, `invalid_starter`, `too_many_items`, `unknown_item`, `invalid_quality` (только `starterAllowed`), `invalid_draft`, `revision_conflict`, `already_configured`, `request_conflict`, `request_pending`, `request_window_full`, `rate_limited`, `actor_busy`, `save_failed`, `partial_commit`, `permission_denied`, `invalid_reason`, `target_not_found`, `not_configured`, `already_reconfigure`, `creation_unavailable`, `receipt_unavailable`, `system_unavailable`.
 
 Подтверждение — одна транзакция пула characters: `character_rps_stats` (архетип, раса, особенность, черта, уровень, максимумы, четыре боевых бонуса, Мастерства, Броня, скорость, лимит Ран), строка `character_rps_creation` (`revision + 1`, `catalog_version`), запись `character_rps_creation_log` со снимком «до» и receipt в `rps_action_receipts` (`result_kind = char_confirm`). Повтор `requestId` с теми же данными отвечает `CharacterConfirmed` без записи (память, затем durable receipt); другие данные — `request_conflict`; повтор во время commit — `request_pending`. Неудачный commit ничего не оставляет: тот же `requestId` можно отправить снова.
 
@@ -188,6 +192,65 @@ RP-имя на сервере не хранится и не проверяетс
 
 Слоты персональных способностей открываются на RP 3/5/7/9, с чертой «Одарённость» — 2/4/6/8 (`K.PersonalAbilitySlots`, `K.GiftedUnlockLevels`).
 
-Коды `DmGrantXp`: `invalid_request_id`, `system_unavailable`, `permission_denied`, `invalid_amount`, `invalid_reason`, `invalid_target`, `target_unavailable`, `at_cap`, `target_dead`, `xp_not_applied`, `request_conflict`, `request_pending`, `receipt_failed`. Повтор `requestId` с той же подписью (`xp:guid:amount:reason`) отвечает `ok` без повторной выдачи (память, затем receipt `rps_action_receipts`, `result_kind = xp_grant`).
+Коды `DmGrantXp`: `invalid_request_id`, `system_unavailable`, `permission_denied`, `invalid_amount`, `invalid_reason`, `invalid_target`, `target_unavailable`, `at_cap`, `target_dead`, `xp_not_applied`, `request_conflict`, `request_pending`, `save_failed`, `pending_recovery`, `receipt_incomplete`, `xp_commit_unavailable`, `xp_level_cap_mismatch`, `xp_gain_blocked`, `xp_curve_mismatch`, `invalid_native_level`. Повтор `requestId` с той же подписью (`xp:guid:amount:reason`) отвечает `ok` без повторной выдачи (память, затем receipt `rps_action_receipts`, `result_kind = xp_grant`).
 
 Проверка: `Addons/tests/test_rps_progression.py` (L01–L08 — автоматическая часть).
+
+## Подтверждённая выдача XP и повтор запроса
+
+Выдача XP использует существующий `rps_action_receipts`, без второго журнала наград:
+
+1. Проверяются права, request ID, причина, сумма, online/живой игрок, свободная операция и native настройки. `RpsXpGrantContext` читает действительный cap, RaF/запрет XP и всю таблицу уровней; несовпадение с 10–19/каталогом запрещает новую выдачу до изменения native состояния.
+2. Одной characters-транзакцией сохраняется `pending` intent с исходными и конечными уровнем/XP, суммой, целью и полным результатом. До commit XP не меняется.
+3. `GiveGuardedXp` применяется, только если native состояние равно исходному. Если оно уже конечное, повтор не добавляет XP. Третье состояние оставляет `pending_recovery` для сверки.
+4. `RpsSaveXpAsync(player, statements, callback)` захватывает значения уровня/XP и добавляет native UPDATE characters перед переводом receipt в `done` в ту же characters-транзакцию. Он не вызывает отдельный `SaveToDB` и не удерживает Player между callbacks. Успех, уведомление и пересчёт RP-листа публикуются после подтверждения.
+
+Отказ записи сохраняет intent; login/таймер или прежний запрос возобновляет его. Неопределённый исход записи intent сначала проверяется в БД. Пока выдача не разрешена, другая выдача и RP-мутации цели блокируются. Долговременный replay сохраняет `newXp`, `rpLevel`, `amount`, `levelsGained` и цель. Старый receipt без payload не исполняется заново: `receipt_incomplete` требует сверки.
+
+`result_payload` — ограниченный до 16 KiB Smallfolk payload (тот же безопасный codec, что в AIO), не Lua-код и не JSON. Боевые receipts также сохраняют полный вложенный результат. Replay атаки/защиты читается до текущей цели, очереди и rate limit; новый request ID остаётся новой операцией. Современный клиент передаёт targetGuid атаки явно.
+
+Для существующего стенда нужны **оба** upgrade-файла `2026_10_27_04_rps_receipt_payload.sql` в соответствующих `characters` и `world`, новая сборка core, Lua и addons. Fresh CREATE уже содержит колонку. Один повтор CREATE TABLE IF NOT EXISTS старую таблицу не обновит. SQL здесь только подготовлен; runtime-конфиг берётся из действующего worldserver.conf, а не автоматически из dist.
+
+Граница протокола — native уровень/XP и их receipt в characters. Почта, достижения и прочие самостоятельные побочные действия native GiveLevel не становятся частью этой транзакции. Для них сохраняются отдельные требования восстановления и игрового прогона.
+
+## Native предметы и именные свойства
+
+`07_RPS_Items` работает в WORLD через Init. Стартовую ткань выдаёт штатное ядро
+(`playercreateinfo_item` + `RPS.StarterOutfit.ReplaceLoadout`), существующим — offline SQL-письмо;
+Lua не создаёт параллельную выдачу.
+
+Свойства суммируются из четырёх слоёв: WORLD `rps_item_template` (по entry), WORLD
+`rps_item_set`/`rps_item_set_bonus` (комплект: все достигнутые пороги надетых частей, слоты 0–17 кроме рубашки),
+CHARACTERS `rps_item_metadata` (экземпляр по item_guid: version/revision/name/description/modifiers) и
+чара + камни из native-слотов чар, сопоставленные с WORLD `rps_item_enchant` (D31; гнёзда по качеству 0/0/1/2/3/3).
+WORLD-определения читает `I.LoadDefinitions` при загрузке; некорректные строки — `item_definition_skipped:*` в логе.
+Свойства действуют на любую вещь со стеком 1 и count 1; `RpsIsRoleplayItem(entry)` (RP_ONLY) влияет только
+на скрытие native-строк в подсказке. Все modifiers проходят один
+C++-парсер `RpsParseItemMetadata`. Native владение остаётся единственным источником истины; при старте Lua
+удаляет sidecar-строки без `item_instance`. Повреждённые свойства не дают бонусов.
+
+Staff-чары: `.rps item catalog`, `.rps item grade <bag> <slot> <0-5>`, `.rps item enchant <bag> <slot> <id|0>`,
+`.rps item gem <bag> <slot> <1-3> <id|0>` (цель — выбранный игрок, иначе сам), AIO `RequestItemEnchantState`/
+`DmItemEnchant` для вкладки DM «Предметы RP». Подробно — [ITEM_INSTANCE_METADATA](../../../Docs/Plans/WarChronicles3d6/ITEM_INSTANCE_METADATA.md).
+
+`RequestItemMetadata(guid)` → `ItemMetadata {guid,entry,state,metadata?,rpOnly,rpItem,grade?,gemSlots?,enchants[],definition?,set?}`
+использует существующий AIO-канал, только собственный inventory/bank. Отрицательный
+ответ без доступной вещи имеет entry=0. Клиент сверяет GUID+entry; plain links не
+идентифицируют экземпляр. Кеш 5 с, late/secret/reused tooltip не перерисовывается.
+
+Staff: `.rps item show <bag> <slot>` и `.rps item set <bag> <slot> <requestId>
+<reason> | <JSON>` — подтверждённая CAS-редакция своей вещи, следующая revision и
+новый request ID для нового изменения. Один повтор возвращает прежний результат;
+исторический receipt не откатывает более свежие свойства в памяти. Для записи
+нужны новая сборка, characters 08 и world 08; свойства сохраняются в отдельных RP-таблицах без изменения базовой схемы.
+Для чар и качества дополнительно нужны hotfixes 07 и world 09 (перед запуском worldserver).
+
+Фактически надетые GUID формируют transient equipment overlay через Resolver.
+`SaveProfiles` сохраняет canonical base, текущие ОЗ/ОЭ/раны/расход, без повторного
+накопления бонусов. Fingerprint500мс, batchDB сверка нового GUID/первого чтения и
+восстановление раз в 30 с. Генератор, материализация прежних шести
+виртуальных предметов, оружейные действия и зелья остаются отдельными задачами.
+
+Подробности: `Docs/Plans/WarChronicles3d6/ITEMS_STAGE_A.md` и
+`ITEM_INSTANCE_METADATA.md`; тесты `test_rps_native_items.py`,
+`test_rps_native_item_tooltip.py`, `contrib/rps_combat/test_item_metadata_mysql.py`.

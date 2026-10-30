@@ -11,8 +11,12 @@ RegisterPlayerEvent(5,function(_,player,spell)
     -- Only the MAP state touches the transient Spell. The WORLD sees IDs only.
     local queued,why=false,"no_binding"
     if RpsQueueDiceCast then queued,why=RpsQueueDiceCast(player,spell) end
-    spell:Cancel()
-    if not queued then
+    if queued then
+        -- Stop the dummy before native effects without reporting an interruption.
+        -- The RP result is still pending in WORLD; Finish acknowledges only this cast.
+        spell:Finish()
+    else
+        spell:Cancel()
         player:SendNotification(why=="cast_pending" and "Предыдущий бросок ещё обрабатывается"
             or why=="queue_full" and "Очередь бросков переполнена" or "Бросок недоступен")
     end
@@ -22,3 +26,5 @@ end)
 CreateLuaEvent(function() if loaded then C.LoadStatDefinitions(); C.RefreshActionSpells() end end,10000,0)
 local progressionOk,progressionErr=pcall(function() require("Modules.RPS_Combat.06_RPS_Progression").InstallMap() end)
 if not progressionOk then print("[NobleNext RPS MAP] progression: "..tostring(progressionErr)) end
+
+require("Modules.RPS_Combat.09_RPS_Consumables").InstallMap()

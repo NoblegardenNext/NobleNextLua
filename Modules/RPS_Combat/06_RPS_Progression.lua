@@ -16,7 +16,7 @@ local P = {
     LocalGuard = {},
 }
 P.COMBAT_STATS = {"accuracy", "healing", "evasion", "resistance"}
-local GIFTED_TRAIT = "odarennost"
+local GIFTED_TRAIT = "gifted"
 
 local function Clamp(value, low, high) return math.max(low, math.min(high, value)) end
 
@@ -176,7 +176,7 @@ function P.InstallWorld(R, H)
     local N = require("NobleNext")
     local S, M, AIO, prefix = R.Storage, R.Combat, N.AIO, C.AIO_PREFIX
     local Escape = require("Core.DB").EscapeSqlString
-    local W = {Grants = {}, RetryAt = {}}
+    local W = {Grants = {}, RetryAt = {}, PendingTargets = {}, Checked = {}}
     P.world = W
     local readTicks = {}
     local function Id(player) return C.IdString(player:GetGUIDLow()) end
@@ -189,6 +189,7 @@ function P.InstallWorld(R, H)
 
     function W.Push(player, extra)
         local guid = Id(player)
+        if W.PendingTargets[guid] then return end
         local profile = S.PlayerProfiles[guid]
         local payload = P.Snapshot(player, profile, profile and Creation(guid) or nil)
         for key, value in pairs(extra or {}) do payload[key] = value end
@@ -199,6 +200,8 @@ function P.InstallWorld(R, H)
     -- Applies native level changes to the cached RP sheet once. Returns true when a commit started.
     function W.Reconcile(player)
         local guid = Id(player)
+        if not W.Checked[guid] then W.Recover(player) end
+        if not W.Checked[guid] or W.PendingTargets[guid] then return false end
         local p = guid and S.PlayerProfiles[guid]
         local rp = P.RpLevel(player:GetLevel())
         if not p or p.level == rp or R.Locks["p:" .. guid] then return false end
@@ -252,102 +255,244 @@ function P.InstallWorld(R, H)
         seen[requestId] = record
     end
 
-    -- DmGrantXp(targetGuid, amount, reason, requestId) -> DmGrantXpResult({ok, code?, requestId, newLevel, newXp}).
+    local function Where(issuer, requestId)
+        return " WHERE issuer_guid=" .. issuer .. " AND request_id=" .. Q(requestId)
+    end
+
+    local function Reply(issuer, requestId, result)
+        local current = FindPlayer(issuer)
+        if not current then return end
+        local copy = {requestId = requestId}
+        for key, value in pairs(result) do copy[key] = value end
+        AIO.Handle(current, prefix, "DmGrantXpResult", copy)
+    end
+
+    local function NativeXpCurve(target)
+        if type(RpsXpGrantContext) ~= "function" then return nil, "xp_commit_unavailable" end
+        local maxLevel = P.MIN_SERVER_LEVEL + P.MAX_RP_LEVEL - 1
+        local cap, blocked, curve = RpsXpGrantContext(target, P.MIN_SERVER_LEVEL, maxLevel)
+        if cap ~= maxLevel then return nil, "xp_level_cap_mismatch" end
+        if blocked then return nil, "xp_gain_blocked" end
+        for _, step in ipairs(K.Xp) do
+            if step.serverLevel < maxLevel and curve[step.serverLevel] ~= step.xpToNext then return nil, "xp_curve_mismatch" end
+        end
+        return curve
+    end
+
+    -- The persisted intent fixes both endpoints before native state can change.
+    local function Plan(target, amount, reason, wanted)
+        local level, xp = target:GetLevel(), target:GetXP()
+        local index = level - P.MIN_SERVER_LEVEL + 1
+        if not K.Xp[index] or index >= P.MAX_RP_LEVEL then return nil, "invalid_native_level" end
+        local curve, why = NativeXpCurve(target)
+        if not curve then return nil, why end
+        if target:GetXPForNextLevel() ~= K.Xp[index].xpToNext then return nil, "xp_curve_mismatch" end
+        local nextLevel, nextXp = level, xp + amount
+        while index < P.MAX_RP_LEVEL and nextXp >= K.Xp[index].xpToNext do
+            nextXp = nextXp - K.Xp[index].xpToNext
+            nextLevel, index = nextLevel + 1, index + 1
+        end
+        return {version = 1, beforeLevel = level, beforeXp = xp, amount = amount, reason = reason,
+            targetGuid = wanted, targetLow = Id(target), result = {ok = true, newLevel = nextLevel,
+                newXp = nextXp, rpLevel = P.RpLevel(nextLevel), levelsGained = nextLevel - level,
+                targetGuid = wanted, amount = amount}}
+    end
+
+    local function ValidPlan(plan)
+        return type(plan) == "table" and plan.version == 1 and type(plan.result) == "table"
+            and C.Integer(plan.beforeLevel, P.MIN_SERVER_LEVEL, P.MIN_SERVER_LEVEL + P.MAX_RP_LEVEL - 2)
+            and C.Integer(plan.beforeXp, 0, P.MAX_GRANT) and C.Integer(plan.amount, 1, P.MAX_GRANT)
+            and C.Integer(plan.result.newLevel, plan.beforeLevel, P.MIN_SERVER_LEVEL + P.MAX_RP_LEVEL - 1)
+            and C.Integer(plan.result.newXp, 0, P.MAX_GRANT * 2)
+            and type(plan.targetGuid) == "string" and C.IdString(plan.targetLow) ~= nil
+            and type(plan.reason) == "string"
+    end
+
+    local function Release(record)
+        local guid = record.plan.targetLow
+        if W.PendingTargets[guid] == record then W.PendingTargets[guid] = nil end
+        if R.Locks["p:" .. guid] == record then R.Locks["p:" .. guid] = nil end
+        W.RetryAt[guid] = nil
+    end
+
+    local function Resume(record)
+        if record.busy then return end
+        local plan, issuer, requestId = record.plan, record.issuer, record.requestId
+        local target = FindPlayer(plan.targetGuid)
+        local function Pending(why)
+            record.busy = false
+            W.RetryAt[plan.targetLow] = os.time() + 30
+            N.Log("RPS_Progression", "xp_pending request=" .. requestId .. " reason=" .. tostring(why))
+            Reply(issuer, requestId, {ok = false, code = "pending_recovery"})
+        end
+        if not record.intentConfirmed then
+            local count = CharDBQuery("SELECT COUNT(*) FROM rps_action_receipts" .. Where(record.issuerLow, requestId))
+            if not count then return Pending("intent_unknown") end
+            if count:GetUInt32(0) == 0 then
+                Release(record)
+                W.Checked[plan.targetLow] = nil
+                local seen = W.Grants[record.issuerLow]
+                if seen and seen[requestId] == record then seen[requestId] = nil end
+                return Reply(issuer, requestId, {ok = false, code = "save_failed"})
+            end
+            local q = CharDBQuery("SELECT signature,state FROM rps_action_receipts" .. Where(record.issuerLow, requestId))
+            if not q or q:GetString(0) ~= record.signature or q:GetString(1) ~= "pending" then return Pending("intent_unknown") end
+            record.intentConfirmed = true
+        end
+        if not target then return Pending("target_unavailable") end
+        local level, xp = target:GetLevel(), target:GetXP()
+        if level == plan.beforeLevel and xp == plan.beforeXp then
+            local curve, why = NativeXpCurve(target)
+            if not curve then return Pending(why) end
+            local given = P.GiveGuardedXp(target, plan.amount)
+            if not given then return Pending("xp_not_applied") end
+        end
+        -- A reload may find the native change already applied. Never add the amount twice.
+        if target:GetLevel() ~= plan.result.newLevel or target:GetXP() ~= plan.result.newXp then
+            return Pending("native_state_conflict")
+        end
+        local payload = assert(S.EncodeReceipt(plan))
+        local sql = "UPDATE rps_action_receipts SET state='done',result_payload=" .. Q(payload)
+            .. Where(record.issuerLow, requestId) .. " AND state='pending'"
+        record.busy = true
+        local entered = false
+        local function Done(saved)
+            entered = true
+            if not saved then return Pending("save_failed") end
+            record.busy, record.result = false, plan.result
+            Release(record)
+            W.Checked[plan.targetLow] = true
+            N.Log("RPS_Progression", "xp_grant issuer=" .. record.issuerLow .. " target=" .. plan.targetGuid
+                .. " amount=" .. plan.amount .. " request=" .. requestId .. " reason=" .. plan.reason)
+            local current = FindPlayer(plan.targetGuid)
+            if current then
+                if current.SendBroadcastMessage then
+                    current:SendBroadcastMessage("Ведущий начислил опыт: +" .. plan.amount .. " (" .. plan.reason .. ")")
+                end
+                if not W.Reconcile(current) then W.Push(current) end
+            end
+            Reply(issuer, requestId, plan.result)
+        end
+        local called = pcall(RpsSaveXpAsync, target, {sql}, Done)
+        if not called and not entered then Done(false) end
+    end
+
+    local function Restore(issuerLow, issuer, requestId, signature, payload)
+        local plan, why = S.DecodeReceipt(payload)
+        if not ValidPlan(plan) then return nil, why or "receipt_incomplete" end
+        local guid = plan.targetLow
+        local record = W.PendingTargets[guid]
+        if record and (record.issuerLow ~= issuerLow or record.requestId ~= requestId) then return nil, "pending_recovery" end
+        if not record then
+            if R.Locks["p:" .. guid] then return nil, "actor_busy" end
+            record = {issuerLow = issuerLow, issuer = issuer, requestId = requestId, signature = signature, plan = plan}
+            R.Locks["p:" .. guid], W.PendingTargets[guid] = record, record
+        end
+        record.intentConfirmed = true
+        record.issuer = issuer or record.issuer
+        return record
+    end
+
+    -- A committed intent survives logout, Lua reload and a server crash. Recovery
+    -- accepts only its before/after endpoints; unrelated native changes need reconciliation.
+    function W.Recover(target)
+        local guid = Id(target)
+        local active = W.PendingTargets[guid]
+        if active then
+            if not W.RetryAt[guid] or os.time() >= W.RetryAt[guid] then Resume(active) end
+            return
+        end
+        local where = " WHERE result_kind='xp_grant' AND state='pending' AND attack_id=" .. Q(guid)
+        local count = CharDBQuery("SELECT COUNT(*) FROM rps_action_receipts" .. where)
+        if not count then return end
+        if count:GetUInt32(0) == 0 then W.Checked[guid] = true; return end
+        local q = CharDBQuery("SELECT issuer_guid,request_id,signature,result_payload FROM rps_action_receipts" .. where)
+        if not q or count:GetUInt32(0) ~= 1 then return end
+        local issuerLow = C.IdString(q:GetUInt64(0))
+        local issuer = nil
+        for _, player in ipairs(GetPlayersInWorld() or {}) do if Id(player) == issuerLow then issuer = R.NormalizeWireGuid(player:GetGUID()) end end
+        local record = Restore(issuerLow, issuer, q:GetString(1), q:GetString(2), q:GetString(3))
+        if record then Resume(record) end
+    end
+
     function W.DmGrantXp(player, targetGuid, amount, reason, requestId)
         local valid = type(requestId) == "string" and #requestId >= 1 and #requestId <= 80
             and requestId:match("^[%w_-]+$") ~= nil
-        local function Reply(result)
-            result.requestId = valid and requestId or nil
-            AIO.Handle(player, prefix, "DmGrantXpResult", result)
-        end
-        if not valid then return Reply({ok = false, code = "invalid_request_id"}) end
-        if not R.ready then return Reply({ok = false, code = "system_unavailable"}) end
-        local issuer = Id(player)
-        if not N.HasStaffPermission(player) then
-            N.Log("RPS_Progression", "xp_grant_denied issuer=" .. tostring(issuer) .. " request=" .. requestId)
-            return Reply({ok = false, code = "permission_denied"})
-        end
-        if not C.Integer(amount, 1, P.MAX_GRANT) then return Reply({ok = false, code = "invalid_amount"}) end
+        local issuer, issuerWire = Id(player), R.NormalizeWireGuid(player:GetGUID())
+        local function Fail(code) Reply(issuerWire, valid and requestId or nil, {ok = false, code = code}) end
+        if not valid then return Fail("invalid_request_id") end
+        if not R.ready then return Fail("system_unavailable") end
+        if not N.HasStaffPermission(player) then return Fail("permission_denied") end
+        if type(RpsSaveXpAsync) ~= "function" or type(RpsXpGrantContext) ~= "function" then return Fail("xp_commit_unavailable") end
+        if not C.Integer(amount, 1, P.MAX_GRANT) then return Fail("invalid_amount") end
         reason = type(reason) == "string" and reason:match("^%s*(.-)%s*$") or ""
-        if #reason < 3 or #reason > 200 or reason:find("%c") then return Reply({ok = false, code = "invalid_reason"}) end
+        if #reason < 3 or #reason > 200 or reason:find("%c") then return Fail("invalid_reason") end
         local wanted = R.NormalizeWireGuid(targetGuid)
-        if not wanted then return Reply({ok = false, code = "invalid_target"}) end
-
+        if not wanted then return Fail("invalid_target") end
         local signature = "xp:" .. wanted .. ":" .. amount .. ":" .. reason
-        local seen = W.Grants[issuer] or {}
-        W.Grants[issuer] = seen
+        local seen = W.Grants[issuer] or {}; W.Grants[issuer] = seen
         local prior = seen[requestId]
         if prior then
-            if prior.signature ~= signature then return Reply({ok = false, code = "request_conflict"}) end
-            if not prior.result then return Reply({ok = false, code = "request_pending"}) end
-            local copy = {}
-            for key, value in pairs(prior.result) do copy[key] = value end
-            copy.duplicate = true
-            return Reply(copy)
+            if prior.signature ~= signature then return Fail("request_conflict") end
+            if prior.result then
+                local result = {duplicate = true}
+                for key, value in pairs(prior.result) do result[key] = value end
+                return Reply(issuerWire, requestId, result)
+            end
+            if prior.busy then return Fail("request_pending") end
         end
-        local where = " WHERE issuer_guid=" .. issuer .. " AND request_id=" .. Q(requestId)
+        local where = Where(issuer, requestId)
         local count = CharDBQuery("SELECT COUNT(*) FROM rps_action_receipts" .. where)
-        if not count then return Reply({ok = false, code = "receipt_unavailable"}) end
+        if not count then return Fail("receipt_unavailable") end
         if count:GetUInt32(0) > 0 then
-            local q = CharDBQuery("SELECT signature,state,total,damage FROM rps_action_receipts" .. where)
-            if not q then return Reply({ok = false, code = "receipt_unavailable"}) end
-            if q:GetString(0) ~= signature then return Reply({ok = false, code = "request_conflict"}) end
-            local result = {ok = true, newLevel = q:GetInt32(3), targetGuid = wanted}
-            Remember(seen, requestId, {signature = signature, result = result})
-            local copy = {duplicate = true}
-            for key, value in pairs(result) do copy[key] = value end
-            return Reply(copy)
+            local q = CharDBQuery("SELECT signature,state,result_payload FROM rps_action_receipts" .. where)
+            if not q then return Fail("receipt_unavailable") end
+            if q:GetString(0) ~= signature then return Fail("request_conflict") end
+            local plan = S.DecodeReceipt(q:GetString(2))
+            if not ValidPlan(plan) then return Fail("receipt_incomplete") end
+            if q:GetString(1) == "done" then
+                local active = W.PendingTargets[plan.targetLow]
+                if active and active.issuerLow == issuer and active.requestId == requestId then Release(active) end
+                local record = {signature = signature, result = plan.result}
+                Remember(seen, requestId, record)
+                local result = {duplicate = true}
+                for key, value in pairs(plan.result) do result[key] = value end
+                return Reply(issuerWire, requestId, result)
+            end
+            local record, why = Restore(issuer, issuerWire, requestId, signature, q:GetString(2))
+            if not record then return Fail(why) end
+            Remember(seen, requestId, record)
+            return Resume(record)
         end
-
         local target = FindPlayer(wanted)
-        if not target then return Reply({ok = false, code = "target_unavailable"}) end
-        local beforeLevel, beforeXp = target:GetLevel(), target:GetXP()
-        if P.RpLevel(beforeLevel) >= P.MAX_RP_LEVEL then
-            return Reply({ok = false, code = "at_cap", newLevel = beforeLevel, newXp = beforeXp})
+        if not target then return Fail("target_unavailable") end
+        if P.RpLevel(target:GetLevel()) >= P.MAX_RP_LEVEL then
+            return Reply(issuerWire, requestId, {ok = false, code = "at_cap", newLevel = target:GetLevel(), newXp = target:GetXP()})
         end
-        if target.IsAlive and not target:IsAlive() then return Reply({ok = false, code = "target_dead"}) end
-
-        local record = {signature = signature}
+        if target.IsAlive and not target:IsAlive() then return Fail("target_dead") end
+        W.Recover(target)
+        if not W.Checked[Id(target)] or W.PendingTargets[Id(target)] then return Fail("pending_recovery") end
+        local plan, why = Plan(target, amount, reason, wanted)
+        if not plan then return Fail(why) end
+        local payload = assert(S.EncodeReceipt(plan))
+        local record
+        record, why = Restore(issuer, issuerWire, requestId, signature, payload)
+        if not record then return Fail(why) end
         Remember(seen, requestId, record)
-        local given, err = P.GiveGuardedXp(target, amount)
-        local afterLevel, afterXp = target:GetLevel(), target:GetXP()
-        if not given or (afterLevel == beforeLevel and afterXp == beforeXp) then
-            seen[requestId] = nil
-            N.Log("RPS_Progression", "xp_grant_not_applied issuer=" .. issuer .. " target=" .. wanted
-                .. " amount=" .. amount .. " error=" .. tostring(err))
-            return Reply({ok = false, code = "xp_not_applied"})
-        end
-        if target.SaveToDB then target:SaveToDB() end
-        local result = {ok = true, newLevel = afterLevel, newXp = afterXp, rpLevel = P.RpLevel(afterLevel),
-            levelsGained = afterLevel - beforeLevel, targetGuid = wanted, amount = amount}
-        N.Log("RPS_Progression", string.format("xp_grant issuer=%s target=%s amount=%d level=%d->%d xp=%d->%d request=%s reason=%s",
-            issuer, wanted, amount, beforeLevel, afterLevel, beforeXp, afterXp, requestId, reason))
-        if target.SendBroadcastMessage then
-            target:SendBroadcastMessage("Ведущий начислил опыт: +" .. amount .. " (" .. reason .. ")")
-        end
-        if not W.Reconcile(target) then W.Push(target) end
-
+        record.busy, record.intentConfirmed = true, false
         local sql = string.format([[INSERT INTO rps_action_receipts
-            (issuer_guid,request_id,signature,state,result_kind,stat_key,total,damage,attack_id)
-            VALUES (%s,%s,%s,'done','xp_grant','',%d,%d,%s)]], issuer, Q(requestId), Q(signature), amount, afterLevel,
-            Q(C.IdString(target:GetGUIDLow()) or ""))
-        local locator, entered = player:GetGUID(), false
-        local function Done(saved)
+            (issuer_guid,request_id,signature,state,result_kind,stat_key,total,damage,attack_id,result_payload)
+            VALUES (%s,%s,%s,'pending','xp_grant','',%d,%d,%s,%s)]], issuer, Q(requestId), Q(signature), amount,
+            plan.result.newLevel, Q(plan.targetLow), Q(payload))
+        local entered = false
+        local function Intended(saved)
             entered = true
-            if not saved then
-                result.code = "receipt_failed"
-                N.Log("RPS_Progression", "xp_grant_receipt_failed issuer=" .. issuer .. " request=" .. requestId)
-            end
-            record.result = result
-            local current = GetPlayerByGUID(locator)
-            if current then
-                local copy = {requestId = requestId}
-                for key, value in pairs(result) do copy[key] = value end
-                AIO.Handle(current, prefix, "DmGrantXpResult", copy)
-            end
+            record.busy = false
+            record.intentConfirmed = saved == true
+            Resume(record)
         end
-        local called = pcall(RpsCommitAsync, "characters", {sql}, Done)
-        if not called and not entered then Done(false) end
+        local called = pcall(RpsCommitAsync, "characters", {sql}, Intended)
+        if not called and not entered then Intended(false) end
     end
 
     H.RequestProgression = W.RequestProgression
@@ -358,6 +503,7 @@ function P.InstallWorld(R, H)
         if not R.ready then return end
         for _, player in ipairs(GetPlayersInWorld() or {}) do
             if player.GetLevel then
+                if not W.Checked[Id(player)] or W.PendingTargets[Id(player)] then W.Recover(player) end
                 local flagged = P.TakeLevelFlag(player)
                 if not W.Reconcile(player) and flagged then W.Push(player) end
             end

@@ -1,4 +1,4 @@
--- Server side: creation options, preview, confirm and staff reconfigure; starter kit.
+-- Server side: creation options, preview, confirm, staff reconfigure, race and archetype resets; starter kit.
 -- No hooks, SQL or AIO on require: Init calls Cr.Register(R, H, Ensure) into its single handler table.
 -- The client never supplies numbers: every sheet is recomputed by V.Resolve at the server RP level.
 local C = require("Modules.RPS_Combat.00_RPS_Config")
@@ -68,6 +68,10 @@ local MESSAGES = {
     race_scope_only = "Сейчас можно изменить только расу и расовую особенность",
     race_preset_current = "Расовый пресет не обновлялся — сброс расы недоступен",
     race_reset_scope = "Сброшены только раса и расовая особенность; остальной выбор и ресурсы сохранены",
+    archetype_scope_only = "Сейчас можно изменить только архетип",
+    archetype_reset_scope = "Сброшен только архетип; остальной выбор и ресурсы сохранены",
+    archetype_reset_cost_changed = "Стоимость смены архетипа изменилась — проверьте цену и повторите",
+    not_enough_money = "Недостаточно денег для смены архетипа",
 }
 function Cr.Message(code) return MESSAGES[code] or code end
 
@@ -104,15 +108,15 @@ Cr.Json = Json
 -- Starter catalog: every Simple-quality weapon, shield and armor plus the consumables.
 -- The kit has no item list of its own, so it is derived from the equipment catalog.
 local CONSUMABLES = {
-    {key = "strela", name = "Стрела", stack = 10}, {key = "pulya", name = "Пуля", stack = 10},
-    {key = "zele_lecheniya", name = "Зелье лечения", stack = 1}, {key = "zele_many", name = "Зелье маны", stack = 1},
-    {key = "paek", name = "Паёк", stack = 1}, {key = "remontnyy_nabor", name = "Ремонтный набор", stack = 1},
-    {key = "aptechka", name = "Аптечка", stack = 1},
+    {key = "arrow", name = "Стрела", stack = 10}, {key = "bullet", name = "Пуля", stack = 10},
+    {key = "healing_potion", name = "Зелье лечения", stack = 1}, {key = "mana_potion", name = "Зелье маны", stack = 1},
+    {key = "ration", name = "Паёк", stack = 1}, {key = "repair_kit", name = "Ремонтный набор", stack = 1},
+    {key = "first_aid_kit", name = "Аптечка", stack = 1},
 }
 local MODE_NAMES = {strike = "Удар", throw = "Бросок", shot = "Выстрел", magic = "Магия"}
-local WEAPON_ORDER = {"one_handed_obychnoe", "one_handed_metatelnoe", "one_handed_dlinnoe", "one_handed_magicheskoe",
-    "one_handed_strelkovoe", "one_handed_porohovoe", "two_handed_obychnoe", "two_handed_dlinnoe",
-    "two_handed_magicheskoe", "two_handed_dalnoboynoe", "two_handed_strelkovoe", "two_handed_porohovoe"}
+local WEAPON_ORDER = {"one_handed_common", "one_handed_throwing", "one_handed_reach", "one_handed_magic",
+    "one_handed_ranged", "one_handed_gunpowder", "two_handed_common", "two_handed_reach",
+    "two_handed_magic", "two_handed_long_range", "two_handed_ranged", "two_handed_gunpowder"}
 
 local function SortedKeys(map)
     local keys = {}
@@ -286,9 +290,7 @@ function Cr.MissingFields(draft)
         Add("mastery", "mastery", "Осталось распределить очков Мастерства: " .. (expected - sum), {left = expected - sum})
     end
     if not K.Archetype(draft.archetype) then Add("archetype", "archetype", "Не выбран архетип") end
-    if type(draft.starterItems) ~= "table" or #draft.starterItems == 0 then
-        Add("starter", "starterItems", "Стартовые предметы не выбраны (необязательно)", {optional = true})
-    end
+    -- Equipment is not part of the wizard (starter vendor); starterItems stays an optional legacy field.
     return missing
 end
 
@@ -325,11 +327,13 @@ function Cr.SheetSummary(sheet)
         block = {die = block.die, flat = block.flat, base = block.base}, passive = passive}
 end
 
--- 'race' after a race data reset (race cleared, other choices kept), 'full' after a staff reconfigure.
+-- 'race' after a race data reset (race cleared, other choices kept), 'archetype' after a player
+-- archetype reset (archetype cleared), 'full' after a staff reconfigure.
 -- Derived from the record, so it survives a relog without its own column.
 function Cr.Scope(rec)
     if rec.state ~= "reconfigure" then return nil end
-    return rec.race == "" and "race" or "full"
+    if rec.race == "" then return "race" end
+    return rec.archetype == "" and "archetype" or "full"
 end
 
 -- A player may reset race data only when the preset of their confirmed race got a newer version.
@@ -364,7 +368,7 @@ local function DraftFrom(rec, profile)
     end
     draft.race = rec.race ~= "" and rec.race or nil
     draft.racialFeature = rec.racialFeature ~= "" and rec.racialFeature or nil
-    draft.archetype = rec.archetype
+    draft.archetype = rec.archetype ~= "" and rec.archetype or nil
     draft.trait, draft.traitChoice = rec.traits[1], rec.traitChoice ~= "" and rec.traitChoice or nil
     draft.mastery = {skill = rec.mastery.skill, knowledge = rec.mastery.knowledge,
         endurance = rec.mastery.endurance, craft = rec.mastery.craft}
@@ -513,22 +517,30 @@ local function Warnings(rec, norm)
     if rec.state == "complete" then Add("already_configured") end
     if rec.starterGranted and #norm.items > 0 then Add("starter_already_granted") end
     if rec.state == "none" then Add("first_creation") else Add("resources_kept") end
-    if Cr.Scope(rec) == "race" then Add("race_reset_scope") end
+    local scope = Cr.Scope(rec)
+    if scope == "race" or scope == "archetype" then Add(scope .. "_reset_scope") end
     return list
 end
 
 -- Scope 'race' accepts only race and racial feature changes. Mastery may differ only when the stored
 -- allocation no longer matches the point total of the new racial feature.
+-- Scope 'archetype' accepts only the archetype; everything else must match the record.
 function Cr.ScopeErrors(rec, norm)
-    if Cr.Scope(rec) ~= "race" then return {} end
-    local errors, n = {}, norm.n
-    local function Check(same, field) if not same then errors[#errors + 1] = {code = "race_scope_only", field = field} end end
-    Check(n.archetype == rec.archetype, "archetype")
+    local scope = Cr.Scope(rec)
+    if scope ~= "race" and scope ~= "archetype" then return {} end
+    local errors, n, code = {}, norm.n, scope .. "_scope_only"
+    local function Check(same, field) if not same then errors[#errors + 1] = {code = code, field = field} end end
+    if scope == "archetype" then
+        Check(n.race == rec.race, "race")
+        Check(n.racialFeature == rec.racialFeature, "racialFeature")
+    else
+        Check(n.archetype == rec.archetype, "archetype")
+    end
     Check((n.traits[1] or "") == (rec.traits[1] or ""), "trait")
     Check((n.traitChoice or "") == (rec.traitChoice or ""), "traitChoice")
     local stored, sum = 0, 0
     for _, key in ipairs(K.MasteryOrder) do stored, sum = stored + rec.mastery[key], sum + n.mastery[key] end
-    if stored == sum then
+    if stored == sum or scope == "archetype" then
         local same = true
         for _, key in ipairs(K.MasteryOrder) do same = same and rec.mastery[key] == n.mastery[key] end
         Check(same, "mastery")
@@ -597,7 +609,7 @@ local function CommitConfirm(player, p, norm, expectedRevision, requestId, recor
     local scopeErrors = Cr.ScopeErrors(rec, norm)
     if #scopeErrors > 0 then
         seen[requestId] = nil
-        Fail(player, "race_scope_only", requestId, Localize(scopeErrors))
+        Fail(player, scopeErrors[1].code, requestId, Localize(scopeErrors))
         return
     end
     local rpLevel = Cr.RpLevel(player)
@@ -830,6 +842,106 @@ function Cr.ResetRaceSelf(player, requestId)
     ResetRace({actor = player, guid = Id(player), target = player, reason = "", requestId = requestId, staff = false})
 end
 
+-- Player archetype reset: the first one is free, each next costs ARCHETYPE_RESET_STEP copper more
+-- (5, 10, 15 silver...). Resets are counted from the creation log rows with reason 'archetype_reset';
+-- staff reconfigures and race resets do not count. Money is taken before the commit and returned
+-- when the commit fails while the player is still online.
+local ARCHETYPE_RESET_STEP, ARCHETYPE_RESET_REASON = 500, "archetype_reset"
+Cr.ArchetypeResetStep, Cr.ArchetypeResets = ARCHETYPE_RESET_STEP, {}
+
+local function ArchetypeResetCount(guid)
+    local cached = Cr.ArchetypeResets[guid]
+    if cached then return cached end
+    local q = CharDBQuery("SELECT COUNT(*) FROM character_rps_creation_log WHERE guid = " .. guid
+        .. " AND action = 'reconfigure' AND reason = " .. Q(ARCHETYPE_RESET_REASON))
+    if not q then return nil end
+    Cr.ArchetypeResets[guid] = q:GetUInt32(0)
+    return Cr.ArchetypeResets[guid]
+end
+
+-- Copper for the next player reset; nil when the log is unreadable.
+function Cr.ArchetypeResetCost(guid)
+    local count = ArchetypeResetCount(guid)
+    return count and count * ARCHETYPE_RESET_STEP or nil
+end
+
+local function SendArchetypeReset(player, requestId, rec, cost)
+    Send(player, "ArchetypeReset", {requestId = requestId, revision = rec and rec.revision,
+        state = rec and rec.state, scope = rec and Cr.Scope(rec), cost = cost})
+end
+
+-- AIO ResetArchetype(expectedCost, requestId): expectedCost is the copper price the client showed;
+-- a different server price refuses the reset and resyncs the price.
+function Cr.ResetArchetype(player, expectedCost, requestId)
+    if not Guard(player, requestId) then return end
+    if not ValidRequestId(requestId) then Fail(player, "invalid_request_id"); return end
+    if not Integer(expectedCost, 0, 2147483647) then Fail(player, "invalid_input", requestId); return end
+    if not Rate(player, "archetype_reset", 400) then Fail(player, "rate_limited", requestId); return end
+    local guid = Id(player)
+    local signature = "archetype_reset:" .. guid .. ":" .. expectedCost
+    local record, seen = BeginRequest(player, guid, requestId, signature, function()
+        SendArchetypeReset(player, requestId, LoadCreation(guid), expectedCost)
+    end)
+    if not record then return end
+    local function Abort(code) seen[requestId] = nil; Fail(player, code, requestId) end
+    local lock = "p:" .. guid
+    if R.Locks[lock] then Abort("actor_busy"); return end
+    local rec, err = LoadCreation(guid)
+    if not rec then Abort(err or "creation_unavailable"); return end
+    if rec.state == "reconfigure" then Abort("already_reconfigure"); return end
+    if rec.state ~= "complete" or rec.archetype == "" then Abort("not_configured"); return end
+    local count = ArchetypeResetCount(guid)
+    if not count then Abort("creation_unavailable"); return end
+    local cost = count * ARCHETYPE_RESET_STEP
+    if cost ~= expectedCost then
+        Abort("archetype_reset_cost_changed")
+        R.SyncPlayerState(player)
+        return
+    end
+    if cost > 0 and player:GetCoinage() < cost then Abort("not_enough_money"); return end
+    local now = os.time()
+    local nextRec = S.CopyCreation(rec)
+    nextRec.state, nextRec.revision, nextRec.archetype = "reconfigure", rec.revision + 1, ""
+    local save, saveErr = S.BuildCreationSave(nextRec)
+    if not save then Abort(saveErr); return end
+    local log, logErr = S.BuildCreationLog({guid = guid, revision = nextRec.revision, action = "reconfigure",
+        fromState = rec.state, toState = "reconfigure", actorGuid = guid, requestId = requestId,
+        reason = ARCHETYPE_RESET_REASON, createdAt = now, snapshotJson = Json({scope = "archetype", cost = cost,
+            resetNumber = count + 1, before = Snapshot(rec, S.PlayerProfiles[guid])})})
+    if not log then Abort(logErr); return end
+    local sql = {save, log, ReceiptSql(guid, requestId, signature, "archetype_reset", nextRec.revision)}
+    local locator = player:GetGUID()
+    R.Locks[lock] = true
+    if cost > 0 then player:ModifyMoney(-cost) end
+    local entered = false
+    local called = pcall(RpsCommitAsync, "characters", sql, function(ok)
+        entered = true
+        R.Locks[lock] = nil
+        local current = GetPlayerByGUID(locator)
+        if not ok then
+            seen[requestId] = nil
+            if cost > 0 then
+                if current then current:ModifyMoney(cost)
+                elseif N then N.Log("RPS_Combat", "archetype_reset_refund_lost guid=" .. guid .. " cost=" .. cost) end
+            end
+            Fail(current, "save_failed", requestId)
+            return
+        end
+        record.done = true
+        Cr.ArchetypeResets[guid] = count + 1
+        if current then
+            S.Creation[guid] = nextRec
+            R.SyncPlayerState(current)
+        else S.Creation[guid] = nil end
+        SendArchetypeReset(current, requestId, nextRec, cost)
+    end)
+    if not called and not entered then
+        R.Locks[lock] = nil
+        if cost > 0 then player:ModifyMoney(cost) end
+        Abort("save_failed")
+    end
+end
+
 local function FindByName(name)
     local wanted = name:lower()
     for _, other in ipairs(GetPlayersInWorld and GetPlayersInWorld() or {}) do
@@ -871,6 +983,7 @@ function Cr.SyncSummary(player)
     if not rec then return nil end
     local out = Cr.Summary(rec)
     out.rpLevel = Cr.RpLevel(player)
+    if rec.state == "complete" and rec.archetype ~= "" then out.archetypeResetCost = Cr.ArchetypeResetCost(Id(player)) end
     return out
 end
 
@@ -883,6 +996,7 @@ function Cr.Register(runtime, handlers, ensure)
     handlers.ConfirmCharacter = Cr.Confirm
     handlers.ReconfigureCharacter = Cr.Reconfigure
     handlers.ResetRaceData = Cr.ResetRaceSelf
+    handlers.ResetArchetype = Cr.ResetArchetype
     R.Creation, R.CreationSummary = Cr, Cr.SyncSummary
     return Cr
 end

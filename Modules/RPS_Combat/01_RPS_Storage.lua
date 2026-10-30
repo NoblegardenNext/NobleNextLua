@@ -4,6 +4,23 @@ local DB = require("Core.DB")
 local S = {PlayerProfiles = {}, NpcTemplateCache = {}, NpcSpawnCache = {}, RuntimeNpcs = {}}
 local MAX_JSON_BYTES, MAX_RUNTIME_NPCS = 16384, 4096
 
+-- AIO already uses this non-executable codec. Retain the complete result, including
+-- nested reaction outcomes, instead of reconstructing a lossy subset after reload.
+function S.EncodeReceipt(result)
+    local codec = Smallfolk or require("smallfolk")
+    local ok, payload = pcall(codec.dumps, result)
+    if not ok or type(payload) ~= "string" or #payload > MAX_JSON_BYTES then return nil, "invalid_receipt" end
+    return payload
+end
+
+function S.DecodeReceipt(payload)
+    if type(payload) ~= "string" or #payload > MAX_JSON_BYTES then return nil, "receipt_incomplete" end
+    local codec = Smallfolk or require("smallfolk")
+    local ok, result = pcall(codec.loads, payload, #payload)
+    if not ok or type(result) ~= "table" then return nil, "invalid_receipt" end
+    return result
+end
+
 -- stats_json is deliberately a flat integer dictionary. Nested equip/effects JSON
 -- stays opaque and is retained byte-for-byte; it must not pass through this codec.
 function S.EncodeFlatJson(stats)
@@ -99,7 +116,7 @@ function S.GetOrLoadPlayerProfile(player, query)
         equipJson = q:GetString(18) or "{}", effectsJson = q:GetString(19) or "{}", isPlayer = true,
         revision = q:GetUInt32(20) or 0, deathOutcome = q:GetString(21) or ""}
     if not C.Archetypes[p.archetype] or not C.Integer(p.level, 1, 10)
-        or not C.Integer(p.energySpentRound, 0, C.MAX_ENERGY_PER_ROUND)
+        or not C.Integer(p.energySpentRound, 0, 1000)
         or not C.Integer(p.maxWounds, 1, 255) or not C.Integer(p.curWounds, 0, 255)
         or not ValidResources(p) then return nil, "invalid_player_profile" end
     for _, def in ipairs(C.StatOrder) do
@@ -225,7 +242,10 @@ end
 function S.ResolveUnitStats(unit)
     if not unit then return nil end
     local player = unit:ToPlayer()
-    if player then return S.GetOrLoadPlayerProfile(player) end
+    if player then
+        local profile, why = S.GetOrLoadPlayerProfile(player)
+        return S.WithEquipment and S.WithEquipment(player, profile) or profile, why
+    end
     local creature = unit:ToCreature()
     if creature then return S.GetCreatureStats(creature) end
 end
@@ -383,6 +403,7 @@ function S.BuildStarterItems(guid, items, createdAt)
 end
 
 function S.BuildSave(profile)
+    if S.CanonicalProfile then profile = S.CanonicalProfile(profile) end
     if type(profile) ~= "table" or not ValidResources(profile) then return nil, "invalid_profile" end
     local stats = S.EncodeFlatJson(profile.stats)
     if not stats then return nil, "invalid_stats" end
@@ -399,7 +420,7 @@ function S.BuildSave(profile)
         local id = C.IdString(profile.guid)
         if not id or id == "0" or not C.Archetypes[profile.archetype]
             or not C.Integer(profile.level,1,10) or not C.Integer(profile.xp,0,4294967295)
-            or not C.Integer(profile.energySpentRound,0,C.MAX_ENERGY_PER_ROUND)
+            or not C.Integer(profile.energySpentRound,0,1000)
             or not C.Integer(profile.curWounds,0,255) or not C.Integer(profile.maxWounds,1,255) then
             return nil, "invalid_player_profile"
         end
@@ -456,7 +477,8 @@ function S.SaveProfiles(profiles, callback, commit, extras)
     if type(commit) ~= "function" then callback(false, "commit_binding_unavailable", {}); return end
     local groups = {characters={}, world={}}
     local drafts = {characters={}, world={}}
-    for _, p in ipairs(profiles) do
+    for _, profile in ipairs(profiles) do
+        local p = S.CanonicalProfile and S.CanonicalProfile(profile) or profile
         local sql, pool = S.BuildSave(p)
         if not sql then callback(false,pool,{}); return end
         groups[pool][#groups[pool]+1], drafts[pool][#drafts[pool]+1] = sql, p
