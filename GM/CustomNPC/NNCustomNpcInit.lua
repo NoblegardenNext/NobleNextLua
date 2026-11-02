@@ -180,7 +180,7 @@ function Handlers.WorldAction(player, key, variation, requestId, action)
     if not key then return end
     local commands = {refresh = "cnpc refresh " .. key .. " " .. variation,
         refresh_all = "cnpc refresh " .. key, reload = "cnpc reload " .. key,
-        spawn = "cnpc spawn " .. key, temp = "cnpc spawn temp " .. key, delete = "cnpc delete " .. key,
+        spawn = "rps persist cnpc-spawn " .. key, temp = "cnpc spawn temp " .. key, delete = "cnpc delete " .. key,
         apply = "cnpc apply " .. variation .. " " .. key}
     local messages = {refresh = "Образ обновлён у использующих его NPC в мире.",
         refresh_all = "Все образы этого NPC обновлены в мире.", reload = "NPC перечитан из базы и обновлён в мире.",
