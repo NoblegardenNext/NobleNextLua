@@ -348,7 +348,15 @@ function GobMoverHandlers.Scale(player, guid, scale)
     end
     if vscale <= 0 then vscale = 0.001 end
     if not CanMutateGo(player, go) then return end
-    go:SetScale(vscale)
+    -- SetScale only changes runtime fields; the native command also saves spawn size.
+    local spawnId = go:GetDBTableGUIDLow()
+    if spawnId and spawnId > 0 then
+        if not player:RunCommand(string.format("gobject set scale %d %.9g", spawnId, vscale)) then
+            return
+        end
+    else
+        go:SetScale(vscale)
+    end
     NobleNext.LogAudit("GobMover", "scale", player,
         string.format("guid=%s scale=%.6f", tostring(guid), vscale))
 end
