@@ -62,42 +62,6 @@ local function IsGmOrDm(player)
 end
 
 -- ---------------------------------------------------------------------------
--- Chat: NPC
--- ---------------------------------------------------------------------------
-local function NPCSayFunc(player, line)
-    local unit = player:GetSelectedUnit()
-    if not unit then return end
-    local lastChar = line:sub(-1)
-    if lastChar == "!" then
-        unit:Emote(5)
-    elseif lastChar == "?" then
-        unit:Emote(6)
-    else
-        unit:Emote(1)
-    end
-    unit:SendUnitSay(line, 0)
-end
-
-local function NPCSayByEmoteFunc(player, line)
-    local unit = player:GetSelectedUnit()
-    if not unit then return end
-    unit:SendUnitEmote("|cffFFFF9F" .. line)
-end
-
-local function NPCEmoteFunc(player, line)
-    local unit = player:GetSelectedUnit()
-    if not unit then return end
-    unit:SendUnitEmote(line)
-end
-
-local function NPCYellFunc(player, line)
-    local unit = player:GetSelectedUnit()
-    if not unit then return end
-    unit:Emote(22)
-    unit:SendUnitYell(line, 0)
-end
-
--- ---------------------------------------------------------------------------
 -- Chat: Color (radius / party)
 -- ---------------------------------------------------------------------------
 local function ChatColorRadius(player, text, radius, colorIdx)
@@ -189,30 +153,14 @@ end
 -- AIO Handlers
 -- ---------------------------------------------------------------------------
 function AddonNDMHandlers.NPCChatRetranslator(player, text, state, radius, color)
-    if IsForbiddenChat(text) then return end
-    if not IsGmOrDm(player) then return end
-
-    local s = tonumber(state)
-    if not s then return end
-
+    -- NPC speech uses native commands. Only party/radius announcements need this AIO route.
+    if tonumber(state) ~= 5 or IsForbiddenChat(text) or not IsGmOrDm(player) then return end
     local fmt = FormatText(text)
-
-    if s == 1 then
-        NPCSayFunc(player, fmt)
-        NobleNext.LogAudit("Master", "npc_say", player, fmt:sub(1, 80))
-    elseif s == 2 then
-        NPCSayByEmoteFunc(player, fmt)
-    elseif s == 3 then
-        NPCEmoteFunc(player, fmt)
-    elseif s == 4 then
-        NPCYellFunc(player, fmt)
-    elseif s == 5 then
-        local r = tonumber(radius) or 0
-        if r == 0 then
-            ChatColorParty(player, fmt, color)
-        else
-            ChatColorRadius(player, fmt, r, color)
-        end
+    local r = tonumber(radius) or 0
+    if r == 0 then
+        ChatColorParty(player, fmt, color)
+    else
+        ChatColorRadius(player, fmt, r, color)
     end
 end
 
@@ -238,85 +186,44 @@ local function LogDeletion(player, gobGuid, gobName)
         "guid=%s name=%s", tostring(gobGuid or "-"), tostring(gobName or "-")))
 end
 
-local function DeleteGobject(go)
-    if not go then return false end
-    local ok, err = pcall(function() go:RemoveFromWorld(true) end)
-    if not ok then
-        NobleNext.LogError("GobDelete", "RemoveFromWorld failed: " .. tostring(err))
-        return false
-    end
-    return true
-end
-
-function AddonNDMHandlers.UndoPhaseGobjects(player, undoRadius)
+local function DeleteNearbyObjects(player, radius, name)
     if not IsGmOrDm(player) then return end
+    local r = tonumber(radius)
+    if not (r and r > 0 and r <= MAX_UNDO_RADIUS) then return end
 
-    local r = tonumber(undoRadius)
-    if type(r) ~= "number" or r > MAX_UNDO_RADIUS or r <= 0 then return end
-
-    local playerPhase = player:GetPhaseMask()
-    player:SendBroadcastMessage("Удаляются GO из фазы [" .. playerPhase .. "]. Радиус " .. r .. " ярдов.")
-
-    NobleNext.LogGobDeleteSession(player)
-
-    local gobs = player:GetGameObjectsInRange(r)
-    if not gobs or #gobs == 0 then
-        player:SendBroadcastMessage("Объекты не найдены.")
+    -- The grid search filters native visibility. The command checks logical RP
+    -- context, RBAC and delete protection for each spawn independently.
+    local targets = {}
+    for _, go in ipairs(player:GetGameObjectsInRange(r) or {}) do
+        local guid = tostring(go:GetDBTableGUIDLow())
+        local goName = go:GetName() or ""
+        if guid:match("^[1-9]%d*$") and (not name or goName:lower():find(name, 1, true)) then
+            targets[#targets + 1] = { guid, goName }
+        end
+    end
+    if #targets == 0 then
+        player:SendBroadcastMessage("Постоянные объекты не найдены.")
         return
     end
 
-    local deleted = 0
-
-    for i = 1, #gobs do
-        local go = gobs[i]
-        if go:GetPhaseMask() == playerPhase then
-            LogDeletion(player, go:GetDBTableGUIDLow(), go:GetName())
-            if DeleteGobject(go) then
-                deleted = deleted + 1
-            end
+    NobleNext.LogGobDeleteSession(player)
+    local accepted = 0
+    for _, target in ipairs(targets) do
+        if player:RunCommand("gobject delete " .. target[1]) then
+            accepted = accepted + 1
+            LogDeletion(player, target[1], target[2])
         end
     end
-
-    player:SendBroadcastMessage("Удалено объектов: " .. deleted)
+    player:SendBroadcastMessage("Команд удаления принято: " .. accepted .. " из " .. #targets .. ".")
 end
 
-function AddonNDMHandlers.UndoPhaseNameGobjects(player, gobName, undoRadius)
-    if not IsGmOrDm(player) then return end
+function AddonNDMHandlers.UndoPhaseGobjects(player, radius)
+    DeleteNearbyObjects(player, radius)
+end
 
-    local r = tonumber(undoRadius)
-    if type(r) ~= "number" or r > MAX_UNDO_RADIUS or r <= 0 then return end
-
+function AddonNDMHandlers.UndoPhaseNameGobjects(player, gobName, radius)
     local name = NobleNext.Trim(gobName)
-    if name:len() < MIN_NAME_LEN then return end
-
-    local playerPhase = player:GetPhaseMask()
-    player:SendBroadcastMessage("Удаляются GO (\"" .. name .. "\") из фазы [" .. playerPhase .. "]. Радиус " .. r .. " ярдов.")
-
-    NobleNext.LogGobDeleteSession(player)
-
-    local gobs = player:GetGameObjectsInRange(r)
-    if not gobs or #gobs == 0 then
-        player:SendBroadcastMessage("Объекты не найдены.")
-        return
-    end
-
-    local deleted = 0
-    local lowerName = name:lower()
-
-    for i = 1, #gobs do
-        local go = gobs[i]
-        if go:GetPhaseMask() == playerPhase then
-            local goName = go:GetName()
-            if goName and goName:lower():find(lowerName, 1, true) then
-                LogDeletion(player, go:GetDBTableGUIDLow(), goName)
-                if DeleteGobject(go) then
-                    deleted = deleted + 1
-                end
-            end
-        end
-    end
-
-    player:SendBroadcastMessage("Удалено объектов: " .. deleted)
+    if #name >= MIN_NAME_LEN then DeleteNearbyObjects(player, radius, name:lower()) end
 end
 
 NobleNext.RegisterModule("MasterPanel", { layer = "GM", aio = "NN_Master", core = "Custom/NobleNext/Master" })

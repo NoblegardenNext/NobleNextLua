@@ -8,7 +8,7 @@
 | Слой | Папка | Назначение |
 |------|-------|------------|
 | **Core** | `Core/` | DB, Batch, AIO helpers, права через `NobleNext` |
-| **GM** | `GM/` | Инструменты GM/DM: Army, Master, Waypoints, POI, … |
+| **GM** | `GM/` | Инструменты GM/DM: Army, Master, GobMover, CustomNPC, POI |
 | **Modules** | `Modules/` | Общий геймплей: Housing, AutoMount |
 
 Система 3d6: WORLD bootstrap
@@ -25,7 +25,7 @@ GM-команды чата (`.weather`, `.daytime`, `.gob tele`, `.movego`, `.wp
 
 - **Мутации и sync** — C++ `Custom/Poi/` (`.poi*`, `RPC_POI_INFO`).
 - **Список** — `.poi list` / `.poilist` (C++).
-- **Lua** — read-only AIO.
+- При перезагрузке Lua для сотрудников повторно запрашивается `.poi sync`.
 
 ## Деплой
 
@@ -46,8 +46,7 @@ Core/
   NNCoreInit.lua           — Batch, DB, RequireStaff, SendClient
 GM/
   NNGmInit.lua             — bootstrap GM-слоя
-  NNGmAIO.lua              — fallback AIO RunGmCommand (клиент шлёт whisper)
-  Army/, MasterPanel/, Waypoints/, GobMover/, Pet/, Weather/, Time/, GobTele/, Status/, POI/
+  Army/, MasterPanel/, GobMover/, CustomNPC/, GobTele/, Status/, POI/
 Modules/
   NNModulesInit.lua
   Housing/, AutoMount/

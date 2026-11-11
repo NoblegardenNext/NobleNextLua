@@ -284,33 +284,6 @@ function Handlers.GetNpcDetail(player, key, variation, requestId, modelRequestId
     AIO.Handle(player, HANDLER_NAME, "NpcDetail", detailOrErr)
 end
 
--- Legacy chat dump (kept for /debug); UI uses GetNpcList.
-function Handlers.List(player)
-    if not RequireStaff(player) then return end
-    local ok, err, confirmed = RunService(player, "cnpc list")
-    AIO.Handle(player, HANDLER_NAME, "Status", ok and confirmed,
-        ok and confirmed and "Список NPC выведен в чат." or err or "Сервер не подтвердил вывод списка.")
-end
-
-function Handlers.Reload(player, key)
-    if not RequireStaff(player) then return end
-    key = Trim(key or "")
-    if key == "" or key:lower() == "all" or key:find("[%s%c|]") then
-        AIO.Handle(player, HANDLER_NAME, "Status", false, "Укажите ключ NPC (не all без подтверждения в UI).")
-        return
-    end
-    local readOk, detail = pcall(player.GetCustomNpcDetail, player, key, 1)
-    if not readOk or type(detail) ~= "table" or detail.canEdit ~= true then
-        AIO.Handle(player, HANDLER_NAME, "Status", false, "Нет права обновлять этого NPC.");return
-    end
-    if detail.supportsCommandResult ~= true then
-        AIO.Handle(player, HANDLER_NAME, "Status", false, "Обновите сервер. Команда обновления NPC не отправлена.");return
-    end
-    local ok, err, confirmed = RunService(player, "cnpc reload " .. key)
-    AIO.Handle(player, HANDLER_NAME, "Status", ok and confirmed,
-        not ok and err or (confirmed and "NPC перечитан на сервере (reload)." or "Команда передана без подтверждения результата. Обновите сервер."))
-end
-
 local function ReadOwnedRegistry(player)
     local registry, offset = {}, 0
     repeat
@@ -387,12 +360,6 @@ end
 
 function Handlers.CloneTarget(player, displayName, subName)
     CreateNpc(player, "cnpc clone target", displayName, subName)
-end
-
-function Handlers.ApplySelected(player, variation)
-    if not RequireStaff(player) then return end
-    -- The old request has no key: it cannot identify which NPC the user intended to edit.
-    AIO.Handle(player, HANDLER_NAME, "Status", false, "Обновите аддон и примените образ из раздела «В мире» выбранного NPC.")
 end
 
 function Handlers.GetFaceOptions(player, key, variation, requestId)

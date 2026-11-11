@@ -299,29 +299,7 @@ function ArmyHandlers.DeleteAllNpcInGroup(player, npcList)
     NobleNext.LogAudit("Army", "delete", player, string.format("count=%d", #list))
 end
 
-function ArmyHandlers.DeleteAllNpcInGroupPerm(player, npcList)
-    local list = npcList
-    if not list or #list == 0 then
-        list = BuildNpcList(player)
-    end
-
-    local map = player:GetMap()
-    if not map then return end
-
-    for i = 1, #list do
-        local info = list[i]
-        local c = SafeGetCreature(info, map)
-        if c and HasPermission(player, c) then
-            c:DespawnOrUnsummon(0)
-        end
-    end
-
-    ClearSelection(player)
-    NobleNext.LogAudit("Army", "delete_perm", player, string.format("count=%d", #list))
-end
-
-ArmyHandlers.CallTableToDel     = ArmyHandlers.DeleteAllNpcInGroup
-ArmyHandlers.CallTableToDelPerm = ArmyHandlers.DeleteAllNpcInGroupPerm
+ArmyHandlers.CallTableToDel = ArmyHandlers.DeleteAllNpcInGroup
 
 function ArmyHandlers.UnselectAll(player)
     ClearSelection(player)

@@ -17,9 +17,9 @@ local GobMoverHandlers = AIO.AddHandlers("NN_GobMover", {})
 
 _G.NobleNextGobMover = _G.NobleNextGobMover or _G.NobleNextGoMover or {}
 
-function GobMoverHandlers.SetTarget(player, guid, name, serverPhaseId)
+function GobMoverHandlers.SetTarget(player, guid, name, serverPhaseId, entry, requestId)
     if _G.NobleNextGobMover.SetTarget then
-        _G.NobleNextGobMover.SetTarget(guid, name, serverPhaseId)
+        _G.NobleNextGobMover.SetTarget(guid, name, serverPhaseId, entry, requestId)
     end
 end
 

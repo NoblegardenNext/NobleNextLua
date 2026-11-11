@@ -11,10 +11,9 @@ if NobleNext._gmLayerBootstrapped then
 end
 NobleNext._gmLayerBootstrapped = true
 
-local GmAIO = require("GM.NNGmAIO")
-GmAIO.Register()
-
 NobleNext.RegisterModule("GM", { role = "staff-tools", layer = "GM" })
+NobleNext.RegisterModule("Weather", { layer = "GM", command = ".weather", core = "Custom/NobleNext/Weather" })
+NobleNext.RegisterModule("TimeCommand", { layer = "GM", command = ".daytime", core = "Custom/NobleNext/Time" })
 NobleNext.Log("GM", "layer loaded (staff tools)")
 
 return { bootstrapped = true }

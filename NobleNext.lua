@@ -54,9 +54,10 @@ NobleNext.Events = {
 NobleNext.AIO = AIO or require("AIO")
 
 -- C++ .movego → AIO (Custom/NobleNext/GobMover)
-function NobleNext.GobMoverSetTarget(player, guid, name, serverPhaseId)
+function NobleNext.GobMoverSetTarget(player, guid, name, serverPhaseId, entry, requestId)
     if not player or not NobleNext.AIO then return end
-    NobleNext.AIO.Handle(player, "NN_GobMover", "SetTarget", guid or 0, name or "", serverPhaseId or 0)
+    NobleNext.AIO.Handle(player, "NN_GobMover", "SetTarget", tostring(guid or 0), name or "",
+        tostring(serverPhaseId or 0), entry, requestId)
 end
 
 -- ---------------------------------------------------------------------------

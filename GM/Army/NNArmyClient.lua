@@ -27,12 +27,6 @@ function ArmyHandlers.CallTableToDel(player)
     end
 end
 
-function ArmyHandlers.CallTableToDelPerm(player)
-    if _G.NobleNextArmy.OnDeletePerm then
-        _G.NobleNextArmy.OnDeletePerm()
-    end
-end
-
 function ArmyHandlers.CallTableToCommand(player, callType, xPos, yPos, zPos)
     if _G.NobleNextArmy.OnCommand then
         _G.NobleNextArmy.OnCommand(callType, xPos, yPos, zPos)
