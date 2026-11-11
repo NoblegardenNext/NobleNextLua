@@ -32,11 +32,20 @@ end
 function M.ExecuteStatRoll(profile, statKey, useFateDie, rng, fatigueStacks)
     local def = type(statKey) == "string" and C.StatDefs[statKey]
     if not def or def.diceFormula == "none" then return nil, "stat_not_rollable" end
-    if type(profile) ~= "table" or not C.Integer(profile.curHealth, 0, 1000000)
-        or not C.Integer(profile.curWounds, 0, 255) then return nil, "invalid_profile" end
-    if profile.curHealth == 0 and profile.curWounds > 0 then return nil, "incapacitated" end
+    if type(profile) ~= "table" then return nil, "invalid_profile" end
+    local wounds = profile.curWounds
+    if wounds == nil and profile.isPlayer == false then wounds = 0 end
+    if not C.Integer(profile.curHealth, 0, 1000000)
+        or not C.Integer(wounds, 0, 255) then return nil, "invalid_profile" end
+    if profile.curHealth == 0 and wounds > 0 then return nil, "incapacitated" end
     if type(useFateDie) ~= "boolean" then return nil, "invalid_fate_choice" end
-    local draft, err = M.SpendEnergy(profile, useFateDie and C.FATE_DIE_COST or 0)
+    local draft, err
+    if profile.isPlayer == false and not useFateDie then
+        -- NPC profiles have no player round budget. This check spends no energy.
+        draft = S.CopyProfile(profile)
+    else
+        draft, err = M.SpendEnergy(profile, useFateDie and C.FATE_DIE_COST or 0)
+    end
     if not draft then return nil, err end
     local fateBonus = useFateDie and C.RollDiceString("1d6", 0, rng).total or 0
     local roll

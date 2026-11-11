@@ -809,12 +809,74 @@ RegisterPlayerEvent(4,function(_,player)
     ticks[key]=nil
     readTicks[key..":self"],readTicks[key..":target"],readTicks[key..":units"]=nil,nil,nil
 end)
+local function RollSelectedNpc(player, args)
+    if not N.HasStaffPermission(player) then Error(player,"permission_denied"); return end
+    if not R.ready then Error(player,"system_unavailable"); return end
+    local key, rest = args:match("^%s*(%S+)%s*(.-)%s*$")
+    local low, high
+    if key == "custom" then
+        if rest == "" then
+            low, high = 1, 100
+        elseif rest:match("^%d+$") then
+            low, high = 1, tonumber(rest)
+        else
+            local first, last = rest:match("^(%d+)%s+(%d+)$")
+            low, high = tonumber(first), tonumber(last)
+        end
+        if not C.Integer(low,0,1000000) or not C.Integer(high,low,1000000) then
+            player:SendBroadcastMessage("Диапазон: .rps npc roll custom [максимум] или custom <минимум> <максимум>. Допустимы целые числа от 0 до 1000000.")
+            return
+        end
+    elseif rest ~= "" or not C.StatDefs[key] or C.StatDefs[key].diceFormula ~= "3d6" then
+        player:SendBroadcastMessage("Использование: .rps npc roll accuracy или .rps npc roll custom [максимум] / custom <минимум> <максимум>.")
+        return
+    end
+    local target = player:GetSelection()
+    if not target or not target:ToCreature() or not RpsTargetContext(player,target,true) then
+        Error(player,"target_unavailable"); return
+    end
+    if not Rate(player) then return end
+    if key == "custom" then
+        local message = string.format("%s выбрасывает %d (%d-%d)",target:GetName(),math.random(low,high),low,high)
+        player:SendBroadcastMessage(message)
+        local group = player:GetGroup()
+        if group then
+            for _, member in ipairs(group:GetMembers()) do
+                if member:GetGUID() ~= player:GetGUID() then member:SendBroadcastMessage(message) end
+            end
+        end
+        return
+    end
+    local def = C.StatDefs[key]
+    local profile, why = S.GetCreatureStats(target:ToCreature())
+    if not profile then
+        if why then Error(player,why); return end
+        profile = S.BuildCreatureProfile(target:ToCreature())
+    end
+    local requestId = NewId()
+    local record = Begin(player,requestId,"npc_roll:"..profile.runtimeKey..":"..key,{profile})
+    if not record then return end
+    local draft, roll = M.ExecuteStatRoll(profile,key,false,nil,profile.stats.debuff_fatigue or 0)
+    if not draft then Abort(player,requestId,record,roll); return end
+    local issuer = player:GetGUID()
+    local message = string.format("%s — %s: 3d6 (%d, %d, %d) %+d = %d",profile.name,def.name,
+        roll.d1,roll.d2,roll.d3,roll.modifier,roll.total)
+    Finish(issuer,requestId,record,{draft},{kind="npc_roll",statKey=key,total=roll.total},nil,function()
+        local gm = Player(issuer)
+        if gm then gm:SendBroadcastMessage(message) end
+    end)
+end
+
 RegisterPlayerEvent(42,function(_,player,command)
     if player then
         local handled = R.Items.Command(player,command)
         if handled == false then return false end
     end
-    -- Never swallow the existing .rps character / npc command trees.
+    local npcRoll = command:match("^rps%s+npc%s+roll(.*)$")
+    if npcRoll and (npcRoll == "" or npcRoll:match("^%s")) then
+        if player then RollSelectedNpc(player,npcRoll) end
+        return false
+    end
     local key,value=command:match("^rps setstat ([a-z][a-z0-9_]*) (%-?%d+)$")
     if key then
         if not player then return false end
